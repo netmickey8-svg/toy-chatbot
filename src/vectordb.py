@@ -258,8 +258,14 @@ def search_documents(
     # ChromaDB 결과를 LangChain Document 형식으로 변환
     docs = []
     if results and results["documents"] and results["documents"][0]:
-        for text, meta in zip(results["documents"][0], results["metadatas"][0]):
-            docs.append(Document(page_content=text, metadata=meta or {}))
+        distances = results.get("distances", [[]])[0]
+        for i, (text, meta) in enumerate(zip(results["documents"][0], results["metadatas"][0])):
+            doc_meta = meta or {}
+            # 유사도 점수를 메타데이터에 추가 (cosine distance → similarity 변환)
+            if i < len(distances):
+                doc_meta["distance"] = round(distances[i], 4)
+                doc_meta["similarity"] = round(1 - distances[i], 4)
+            docs.append(Document(page_content=text, metadata=doc_meta))
 
     return docs
 

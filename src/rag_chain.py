@@ -47,7 +47,7 @@ genai.configure(api_key=GOOGLE_API_KEY)
 # ──────────────────────────────────────────────
 # {context}: 검색된 제안서 내용을 포맷팅한 텍스트 (format_documents() 결과)
 # {question}: 사용자 원본 질문
-SYSTEM_PROMPT = """당신은 제안서 추천 전문가입니다.
+SYSTEM_PROMPT = """당신은 제안서 전문가입니다.
 사용자의 질문에 맞는 제안서를 검색하고 관련 내용을 설명해주세요.
 
 ## 지침
@@ -125,29 +125,26 @@ class RAGChain:
         question: str,
         department: str | None = None,
         year: str | None = None,
-    ) -> tuple[str, list[Document]]:
+    ) -> tuple[str, list[Document], dict]:
         """
         사용자 질문에 대한 RAG 기반 답변 생성
 
-        처리 단계:
-            1. [Query]  질문에서 페이지 번호 파싱 (예: "3페이지" → page_number=3)
-            2. [Query]  bge-m3 임베딩으로 관련 청크 검색 (Dense Retrieval)
-            3. [LLM]    검색 결과를 컨텍스트로 프롬프트 생성
-            4. [LLM]    Gemini API로 자연어 답변 생성
-
-        Args:
-            question:   사용자 질문 텍스트
-            department: 부문 필터 ("R&D부문" / "SI부문" / None=전체)
-            year:       연도 필터 ("2025" 등 / None=전체)
-
         Returns:
-            tuple: (답변 텍스트, 참조된 Document 리스트)
+            tuple: (답변 텍스트, 참조된 Document 리스트, 파이프라인 단계별 정보)
         """
-        # ── Step 1: 페이지 번호 파싱 ──────────────────────
-        # 예: "3페이지 내용 알려줘" → page_number = 3
-        # 버그 수정: r"(\d+)\s*페이지" (이전: 이중 이스케이프 r"(\\d+)\\s*페이지")
+        # 파이프라인 단계별 정보를 수집하는 딕셔너리
+        pipeline_info: dict = {}
+
+        # ── Step 1: 쿼리 분석 ─────────────────────────────
         page_match = re.search(r"(\d+)\s*페이지", question)
         page_number = int(page_match.group(1)) if page_match else None
+
+        pipeline_info["query_analysis"] = {
+            "original_query": question,
+            "department_filter": department or "전체",
+            "year_filter": year or "전체",
+            "page_filter": page_number,
+        }
 
         # ── Step 2: 트랜스포머 임베딩 기반 문서 검색 ──────
         docs = search_documents(
@@ -158,12 +155,38 @@ class RAGChain:
             page_number=page_number,
         )
 
+        pipeline_info["retrieval"] = {
+            "model": "BAAI/bge-m3",
+            "method": "Dense Retrieval (코사인 유사도)",
+            "results_count": len(docs),
+            "chunks": [
+                {
+                    "rank": i + 1,
+                    "file_name": doc.metadata.get("file_name", "Unknown"),
+                    "department": doc.metadata.get("department", ""),
+                    "year": doc.metadata.get("year", ""),
+                    "page": doc.metadata.get("page_number", "-"),
+                    "similarity": doc.metadata.get("similarity", 0),
+                    "preview": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
+                }
+                for i, doc in enumerate(docs)
+            ],
+        }
+
         if not docs:
-            return "관련된 제안서를 찾지 못했습니다. 다른 키워드로 검색해보세요.", []
+            pipeline_info["generation"] = {"status": "검색 결과 없음 - LLM 호출 생략"}
+            return "관련된 제안서를 찾지 못했습니다. 다른 키워드로 검색해보세요.", [], pipeline_info
 
         # ── Step 3: 프롬프트 생성 ─────────────────────────
         context = format_documents(docs)
         prompt = SYSTEM_PROMPT.format(context=context, question=question)
+
+        pipeline_info["prompt"] = {
+            "template": "시스템 프롬프트 + 검색 컨텍스트 + 사용자 질문",
+            "context_length": len(context),
+            "total_prompt_length": len(prompt),
+            "prompt_preview": prompt[:500] + "...(이하 생략)" if len(prompt) > 500 else prompt,
+        }
 
         # ── Step 4: Gemini LLM 답변 생성 ──────────────────
         try:
@@ -171,7 +194,7 @@ class RAGChain:
             response = model.generate_content(
                 prompt,
                 generation_config={
-                    "temperature": 0.3,       # 낮을수록 일관된 답변
+                    "temperature": 0.3,
                     "max_output_tokens": 1024,
                 },
             )
@@ -180,12 +203,21 @@ class RAGChain:
                 if getattr(response, "text", None)
                 else "답변 생성에 실패했습니다."
             )
+            pipeline_info["generation"] = {
+                "model": GEMINI_MODEL,
+                "temperature": 0.3,
+                "status": "성공",
+                "answer_length": len(answer),
+            }
         except Exception as e:
-            # API 오류(네트워크 장애, 키 만료 등) 발생 시 사용자 친화적 메시지 반환
             print(f"[ERROR] Gemini API 오류: {e}")
             answer = f"⚠️ 답변 생성 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.\n(상세: {e})"
+            pipeline_info["generation"] = {
+                "model": GEMINI_MODEL,
+                "status": f"오류: {e}",
+            }
 
-        return answer, docs
+        return answer, docs, pipeline_info
 
     def is_ready(self) -> bool:
         """

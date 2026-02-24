@@ -1,4 +1,4 @@
-# 📄 제안서 추천 챗봇
+# 📄 제안서 챗봇
 
 PDF 제안서를 기반으로 질문에 답변하는 **RAG(Retrieval-Augmented Generation) 챗봇**입니다.  
 발표자료 권장 스택: **bge-m3 Dense 임베딩 + ChromaDB + Gemini LLM**
