@@ -1,0 +1,189 @@
+"""
+제안서 추천 챗봇 - Streamlit UI
+"""
+import streamlit as st
+from pathlib import Path
+
+import sys
+sys.path.insert(0, str(Path(__file__).parent))
+
+from src.rag_chain import RAGChain
+from src.vectordb import load_vectorstore
+
+
+# 페이지 설정
+st.set_page_config(
+    page_title="제안서 추천 챗봇",
+    page_icon="📄",
+    layout="wide"
+)
+
+# 커스텀 스타일
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        color: #1E88E5;
+        text-align: center;
+        padding: 1rem;
+    }
+    .chat-message {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        margin: 0.5rem 0;
+    }
+    .user-message {
+        background-color: #E3F2FD;
+    }
+    .assistant-message {
+        background-color: #F5F5F5;
+    }
+    .source-card {
+        background-color: #FFF3E0;
+        padding: 0.5rem;
+        border-radius: 0.3rem;
+        margin: 0.3rem 0;
+        font-size: 0.9rem;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+
+def initialize_session_state():
+    """세션 상태 초기화"""
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "rag_chain" not in st.session_state:
+        st.session_state.rag_chain = None
+
+
+def load_rag_chain():
+    """RAG 체인 로드"""
+    if st.session_state.rag_chain is None:
+        with st.spinner("🔄 챗봇을 초기화하는 중..."):
+            st.session_state.rag_chain = RAGChain()
+    return st.session_state.rag_chain
+
+
+def display_chat_history():
+    """채팅 기록 표시"""
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            
+            # 참조 문서 표시
+            if "sources" in message and message["sources"]:
+                with st.expander("📚 참조된 제안서"):
+                    for doc in message["sources"]:
+                        meta = doc.metadata
+                        st.markdown(f"""
+                        <div class="source-card">
+                            <strong>📄 {meta.get('file_name', 'Unknown')[:50]}...</strong><br>
+                            📁 {meta.get('department', '')} | 📅 {meta.get('year', '')}년 | 📄 {meta.get('page_number', '')}p
+                        </div>
+                        """, unsafe_allow_html=True)
+
+
+def main():
+    """메인 앱"""
+    initialize_session_state()
+    
+    # 헤더
+    st.markdown('<h1 class="main-header">📄 제안서 추천 챗봇</h1>', unsafe_allow_html=True)
+    st.markdown("---")
+    
+    # 사이드바 - 필터 옵션
+    with st.sidebar:
+        st.header("🔍 검색 필터")
+        
+        department = st.selectbox(
+            "부문 선택",
+            options=["전체", "R&D부문", "SI부문"],
+            index=0
+        )
+        
+        year = st.selectbox(
+            "연도 선택",
+            options=["전체", "2024", "2025", "2026"],
+            index=0
+        )
+        
+        st.markdown("---")
+        st.markdown("""
+        ### 💡 사용 예시
+        - "블록체인 관련 제안서 알려줘"
+        - "2025년 플랫폼 프로젝트는?"
+        - "메타버스 프로젝트 내용 요약해줘"
+        - "대구시 관련 사업 있어?"
+        """)
+        
+        st.markdown("---")
+        if st.button("🗑️ 대화 기록 삭제"):
+            st.session_state.messages = []
+            st.rerun()
+    
+    # RAG 체인 로드
+    rag = load_rag_chain()
+    
+    # 벡터스토어 확인
+    if not rag.is_ready():
+        st.error("""
+        ⚠️ **벡터스토어가 없습니다!**
+
+        먼저 다음 명령어로 PDF를 인덱싱하세요:
+        ```bash
+        python index_data.py
+        ```
+        """)
+        return
+    
+    # 채팅 기록 표시
+    display_chat_history()
+    
+    # 사용자 입력
+    if prompt := st.chat_input("제안서에 대해 질문하세요..."):
+        # 사용자 메시지 표시
+        with st.chat_message("user"):
+            st.markdown(prompt)
+        
+        st.session_state.messages.append({
+            "role": "user",
+            "content": prompt
+        })
+        
+        # 필터 설정
+        dept_filter = None if department == "전체" else department
+        year_filter = None if year == "전체" else year
+        
+        # AI 응답 생성
+        with st.chat_message("assistant"):
+            with st.spinner("🤔 답변을 생성하는 중..."):
+                answer, docs = rag.ask(
+                    question=prompt,
+                    department=dept_filter,
+                    year=year_filter
+                )
+            
+            st.markdown(answer)
+            
+            # 참조 문서 표시
+            if docs:
+                with st.expander("📚 참조된 제안서"):
+                    for doc in docs:
+                        meta = doc.metadata
+                        st.markdown(f"""
+                        <div class="source-card">
+                            <strong>📄 {meta.get('file_name', 'Unknown')[:50]}...</strong><br>
+                            📁 {meta.get('department', '')} | 📅 {meta.get('year', '')}년 | 📄 {meta.get('page_number', '')}p
+                        </div>
+                        """, unsafe_allow_html=True)
+        
+        st.session_state.messages.append({
+            "role": "assistant",
+            "content": answer,
+            "sources": docs
+        })
+
+
+if __name__ == "__main__":
+    main()

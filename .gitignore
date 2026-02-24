@@ -1,0 +1,31 @@
+# API 키 및 환경 변수 (절대 커밋 금지!)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+.venv/
+
+# 벡터 데이터베이스 (용량이 크므로 제외)
+vectorstore/
+chroma_db/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 빌드 결과물
+dist/
+build/
+*.spec
+
+# 기타
+.DS_Store
+Thumbs.db
