@@ -30,17 +30,11 @@ from pathlib import Path
 # 프로젝트 루트를 import 경로에 추가
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-import google.generativeai as genai
 from langchain_core.documents import Document
 
-from config import GOOGLE_API_KEY, GEMINI_MODEL
+from openai import OpenAI
+from config import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL
 from src.vectordb import load_vectorstore, search_documents
-
-# ──────────────────────────────────────────────
-# Gemini API 초기화
-# ──────────────────────────────────────────────
-# 모듈 로드 시점에 API 키 설정 (RAGChain 인스턴스마다 중복 호출 방지)
-genai.configure(api_key=GOOGLE_API_KEY)
 
 # ──────────────────────────────────────────────
 # 시스템 프롬프트 템플릿
@@ -191,32 +185,30 @@ class RAGChain:
             "prompt_preview": prompt[:500] + "...(이하 생략)" if len(prompt) > 500 else prompt,
         }
 
-        # ── Step 4: Gemini LLM 답변 생성 ──────────────────
+        # ── Step 4: 로컬 LLM 답변 생성 ───────────────────
         try:
-            model = genai.GenerativeModel(GEMINI_MODEL)
-            response = model.generate_content(
-                prompt,
-                generation_config={
-                    "temperature": 0.3,
-                    "max_output_tokens": 1024,
-                },
+            client = OpenAI(base_url=LLM_BASE_URL, api_key=LLM_API_KEY)
+            response = client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": "너는 제안서 전문가다. 근거 기반으로 간결하게 답한다."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_tokens=1024,
             )
-            answer = (
-                response.text.strip()
-                if getattr(response, "text", None)
-                else "답변 생성에 실패했습니다."
-            )
+            answer = response.choices[0].message.content.strip()
             pipeline_info["generation"] = {
-                "model": GEMINI_MODEL,
+                "model": LLM_MODEL,
                 "temperature": 0.3,
                 "status": "성공",
                 "answer_length": len(answer),
             }
         except Exception as e:
-            print(f"[ERROR] Gemini API 오류: {e}")
+            print(f"[ERROR] LLM API 오류: {e}")
             answer = f"⚠️ 답변 생성 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.\n(상세: {e})"
             pipeline_info["generation"] = {
-                "model": GEMINI_MODEL,
+                "model": LLM_MODEL,
                 "status": f"오류: {e}",
             }
 

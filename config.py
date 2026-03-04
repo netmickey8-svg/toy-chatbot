@@ -24,8 +24,8 @@ load_dotenv()
 PROJECT_ROOT: Path = Path(__file__).parent
 
 # 제안서 PDF가 저장된 디렉토리
-# 환경변수 DATA_DIR 미설정 시 기본값 사용 (다른 PC에서 실행 시 .env에 DATA_DIR 지정 권장)
-DATA_DIR: Path = Path(os.getenv("DATA_DIR", r"C:\Users\User\Downloads\제안서"))
+# 환경변수 DATA_DIR 미설정 시 프로젝트 내부 data/ 사용
+DATA_DIR: Path = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT / "data")))
 
 # 벡터스토어(임베딩 인덱스) 저장 디렉토리
 VECTORSTORE_DIR: Path = PROJECT_ROOT / "vectorstore"
@@ -34,14 +34,12 @@ VECTORSTORE_DIR: Path = PROJECT_ROOT / "vectorstore"
 INDEX_LOG_DIR: Path = VECTORSTORE_DIR / "index_logs"
 
 # ──────────────────────────────────────────────
-# Google Gemini API 설정
+# LLM API 설정 (OpenAI 호환 로컬 서버)
 # ──────────────────────────────────────────────
-# API 키: .env 파일의 GOOGLE_API_KEY 항목에서 로드
-GOOGLE_API_KEY: str | None = os.getenv("GOOGLE_API_KEY")
-
-# 사용할 Gemini 모델명
-# 참고: https://ai.google.dev/gemini-api/docs/models
-GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+# 문서 기준 기본값: Qwen3-vl-2b vLLM 서버
+LLM_BASE_URL: str = os.getenv("LLM_BASE_URL", "http://192.168.5.94:8001/v1")
+LLM_API_KEY: str = os.getenv("LLM_API_KEY", "EMPTY")
+LLM_MODEL: str = os.getenv("LLM_MODEL", "qwen3-vl-2b-instruct")
 
 # ──────────────────────────────────────────────
 # 임베딩 설정 (API 또는 로컬)

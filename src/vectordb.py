@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import sys
+import hashlib
 from pathlib import Path
 
 # 프로젝트 루트를 import 경로에 추가 (어디서 실행해도 동작하도록)
@@ -93,7 +94,6 @@ def _get_embedding_function():
 
     return SentenceTransformerEmbeddingFunction(
         model_name=EMBEDDING_MODEL,
-        batch_size=EMBEDDING_BATCH_SIZE,
         normalize_embeddings=True,
     )
 
@@ -171,6 +171,77 @@ def create_vectorstore(chunks: list[Document]) -> chromadb.Collection:
         print(f"  [OK] {end}/{len(chunks)}개 처리 완료")
 
     print(f"\n[OK] 벡터스토어 생성 완료!")
+    return collection
+
+
+def _ensure_collection(embedding_fn) -> chromadb.Collection:
+    """
+    컬렉션이 없으면 생성, 있으면 로드
+    """
+    client = _get_chroma_client()
+    try:
+        return client.get_collection(
+            name=COLLECTION_NAME,
+            embedding_function=embedding_fn,
+        )
+    except Exception:
+        return client.create_collection(
+            name=COLLECTION_NAME,
+            embedding_function=embedding_fn,
+            metadata={"hnsw:space": "cosine"},
+        )
+
+
+def _chunk_id(meta: dict, chunk_text: str, idx: int) -> str:
+    """
+    청크 고유 ID 생성 (동일 파일 재업로드 시 안정적으로 덮어쓰기)
+    """
+    base = f"{meta.get('file_path','')}|{meta.get('page_number','')}|{idx}|{chunk_text[:80]}"
+    return hashlib.md5(base.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def upsert_vectorstore(
+    chunks: list[Document],
+    collection: chromadb.Collection | None = None,
+    overwrite_files: list[str] | None = None,
+) -> chromadb.Collection:
+    """
+    청크를 벡터스토어에 증분 업서트
+    """
+    if not chunks:
+        raise ValueError("업서트할 청크가 없습니다.")
+
+    embedding_fn = _get_embedding_function()
+    if collection is None:
+        collection = _ensure_collection(embedding_fn)
+
+    if overwrite_files:
+        for name in overwrite_files:
+            try:
+                collection.delete(where={"file_name": {"$eq": name}})
+            except Exception:
+                continue
+
+    texts = [chunk.page_content for chunk in chunks]
+    metadatas = [
+        {k: v for k, v in (chunk.metadata or {}).items() if v is not None}
+        for chunk in chunks
+    ]
+    ids = [
+        _chunk_id(metadatas[i], texts[i], i)
+        for i in range(len(chunks))
+    ]
+
+    batch = EMBEDDING_BATCH_SIZE
+    for start in range(0, len(chunks), batch):
+        end = min(start + batch, len(chunks))
+        collection.upsert(
+            ids=ids[start:end],
+            documents=texts[start:end],
+            metadatas=metadatas[start:end],
+        )
+        print(f"  [OK] {end}/{len(chunks)}개 처리 완료")
+
     return collection
 
 

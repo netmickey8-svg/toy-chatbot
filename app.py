@@ -3,12 +3,17 @@
 """
 import streamlit as st
 from pathlib import Path
+import re
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.rag_chain import RAGChain
-from src.vectordb import get_indexed_file_names
+from src.vectordb import get_indexed_file_names, upsert_vectorstore
+from src.pdf_processor import process_pdf
+from src.chunker import chunk_document
+from src.index_logs import load_index_log, write_index_logs
+from config import DATA_DIR
 from src.index_logs import load_index_log
 
 
@@ -56,6 +61,8 @@ def initialize_session_state():
         st.session_state.messages = []
     if "rag_chain" not in st.session_state:
         st.session_state.rag_chain = None
+    if "last_chunk_preview" not in st.session_state:
+        st.session_state.last_chunk_preview = []
 
 
 def load_rag_chain():
@@ -89,6 +96,26 @@ def render_index_log(log: dict) -> None:
         for page in sorted(chunks_per_page.keys(), key=lambda x: int(x)):
             lines.append(f"p{page}: {chunks_per_page[page]}")
         st.code("\n".join(lines), language=None)
+
+
+def infer_department(file_name: str) -> str:
+    """파일명 기반 부문 자동 분류"""
+    name = file_name.upper()
+    if "SI" in name or "SYSTEM INTEGRATION" in name:
+        return "SI부문"
+    if "R&D" in name or "RND" in name or "RD" in name:
+        return "R&D부문"
+    return "R&D부문"
+
+
+def save_uploaded_pdf(uploaded_file, department: str) -> Path:
+    """업로드된 PDF를 data 디렉토리에 저장"""
+    target_dir = DATA_DIR / department
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target_path = target_dir / uploaded_file.name
+    with open(target_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return target_path
 
 
 def display_pipeline_info(pipeline_info: dict):
@@ -194,6 +221,49 @@ def main():
 
     # 사이드바 - 필터 옵션
     with st.sidebar:
+        st.header("📥 PDF 업로드")
+        uploaded_file = st.file_uploader("PDF 파일 업로드", type=["pdf"])
+        if uploaded_file:
+            auto_department = infer_department(uploaded_file.name)
+            st.caption(f"자동 분류: {auto_department}")
+            if st.button("업로드 및 인덱싱"):
+                try:
+                    saved_path = save_uploaded_pdf(uploaded_file, auto_department)
+                    doc = process_pdf(saved_path, auto_department)
+                    if not doc:
+                        st.error("PDF 텍스트 추출에 실패했습니다.")
+                    else:
+                        chunks = chunk_document(doc)
+                        if not chunks:
+                            st.error("청크 생성에 실패했습니다.")
+                        else:
+                            rag.vectorstore = upsert_vectorstore(
+                                chunks,
+                                rag.vectorstore,
+                                overwrite_files=[doc.metadata.file_name],
+                            )
+                            write_index_logs([doc], chunks)
+                            preview = []
+                            for chunk in chunks[:10]:
+                                meta = chunk.metadata or {}
+                                preview.append(
+                                    {
+                                        "page_number": meta.get("page_number", "-"),
+                                        "length": len(chunk.page_content),
+                                        "text": (
+                                            chunk.page_content[:300] + "..."
+                                            if len(chunk.page_content) > 300
+                                            else chunk.page_content
+                                        ),
+                                    }
+                                )
+                            st.session_state.last_chunk_preview = preview
+                            st.success("업로드 및 인덱싱 완료")
+                            st.rerun()
+                except Exception as e:
+                    st.error(f"업로드/인덱싱 오류: {e}")
+
+        st.markdown("---")
         st.header("🔍 검색 필터")
 
         department = st.selectbox(
@@ -248,6 +318,16 @@ def main():
         ```
         """)
         return
+
+    # 최근 업로드 청킹 결과 미리보기
+    if st.session_state.last_chunk_preview:
+        with st.expander("🧩 청킹 결과 미리보기 (최근 업로드)", expanded=False):
+            for i, item in enumerate(st.session_state.last_chunk_preview, 1):
+                st.markdown(
+                    f"**#{i}** | p{item['page_number']} | {item['length']}자"
+                )
+                st.text(item["text"])
+                st.markdown("---")
 
     # 채팅 기록 표시
     display_chat_history()
