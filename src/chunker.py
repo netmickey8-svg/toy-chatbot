@@ -30,34 +30,66 @@ from pathlib import Path
 # 프로젝트 루트를 import 경로에 추가
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
 
 from config import CHUNK_SIZE, CHUNK_OVERLAP
 from src.pdf_processor import ProcessedDocument
 
 
-def create_text_splitter() -> RecursiveCharacterTextSplitter:
+def _split_into_units(text: str) -> list[str]:
     """
-    텍스트 분할기(RecursiveCharacterTextSplitter) 생성
+    텍스트를 의미 단위(문단/줄/문장)로 1차 분해
 
-    분할 순서 (구분자 우선순위):
-        1. 문단 구분 (\\n\\n)   ← 가장 먼저 시도 (의미 단위 최대 보존)
-        2. 줄 바꿈 (\\n)
-        3. 문장 끝 (.)
-        4. 공백 ( )
-        5. 문자 단위            ← 최후 수단 (의미 손실 발생)
-
-    Returns:
-        설정된 RecursiveCharacterTextSplitter 인스턴스
+    - 외부 라이브러리 의존 없이 동작하도록 단순 규칙 기반 분해 사용
+    - 문단(빈 줄) → 줄 → 문장 끝 구두점 기준 분해
     """
-    return RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-        # 한국어 문장 구분자 추가 (마침표 포함)
-        separators=["\n\n", "\n", ".", "。", "!", "?", " ", ""],
-        length_function=len,
-    )
+    text = text.replace("\r\n", "\n").strip()
+    if not text:
+        return []
+
+    units: list[str] = []
+    paragraphs = re.split(r"\n{2,}", text)
+    for para in paragraphs:
+        lines = [ln.strip() for ln in para.split("\n") if ln.strip()]
+        for line in lines:
+            # 문장 끝 구두점 기준 분리 (한국어 마침표 포함)
+            sentences = re.split(r"(?<=[\.\!\?\u3002])\s+", line)
+            for sent in sentences:
+                sent = sent.strip()
+                if sent:
+                    units.append(sent)
+    return units
+
+
+def _pack_units_to_chunks(units: list[str]) -> list[str]:
+    """
+    분해된 단위를 CHUNK_SIZE 기준으로 병합하여 청크 생성
+    """
+    if not units:
+        return []
+
+    chunks: list[str] = []
+    current = ""
+
+    for unit in units:
+        if not current:
+            current = unit
+            continue
+
+        if len(current) + 1 + len(unit) <= CHUNK_SIZE:
+            current = f"{current} {unit}"
+        else:
+            chunks.append(current)
+            if CHUNK_OVERLAP > 0:
+                overlap = current[-CHUNK_OVERLAP:]
+                current = f"{overlap} {unit}"
+            else:
+                current = unit
+
+    if current:
+        chunks.append(current)
+
+    return chunks
 
 
 def _clean_text(text: str) -> str:
@@ -98,7 +130,6 @@ def chunk_document(doc: ProcessedDocument) -> list[Document]:
         청크 단위로 분할된 LangChain Document 리스트
         (각각 page_content + metadata 포함)
     """
-    splitter = create_text_splitter()
     chunks: list[Document] = []
 
     for page in doc.pages:
@@ -107,7 +138,8 @@ def chunk_document(doc: ProcessedDocument) -> list[Document]:
             continue  # 빈 페이지 스킵
 
         # 현재 페이지를 CHUNK_SIZE 이하 단위로 분할
-        text_chunks = splitter.split_text(clean_content)
+        units = _split_into_units(clean_content)
+        text_chunks = _pack_units_to_chunks(units) or [clean_content[:CHUNK_SIZE]]
 
         for chunk_text in text_chunks:
             if not chunk_text.strip():

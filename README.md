@@ -1,15 +1,15 @@
 # 📄 제안서 챗봇
 
 PDF 제안서를 기반으로 질문에 답변하는 **RAG(Retrieval-Augmented Generation) 챗봇**입니다.  
-발표자료 권장 스택: **bge-m3 Dense 임베딩 + ChromaDB + Gemini LLM**
+권장 스택: **OpenAI Embeddings + ChromaDB + Gemini LLM**
 
 ---
 
 ## 🏗️ RAG 파이프라인 구조
 
 ```
-[인덱싱]  PDF → 텍스트/표/OCR 추출 → 청킹(800자) → bge-m3 임베딩 → ChromaDB 저장
-[검색]    쿼리 → bge-m3 임베딩 → ChromaDB 유사도 검색 → 상위 5개 청크
+[인덱싱]  PDF → 텍스트/표/OCR 추출 → 청킹(800자) → OpenAI 임베딩 → ChromaDB 저장
+[검색]    쿼리 → OpenAI 임베딩 → ChromaDB 유사도 검색 → 상위 5개 청크
 [생성]    검색 결과 + 쿼리 → Gemini Prompt → 자연어 답변
 ```
 
@@ -18,7 +18,7 @@ PDF 제안서를 기반으로 질문에 답변하는 **RAG(Retrieval-Augmented G
 | 기능 | 설명 |
 |------|------|
 | PDF 파싱 | 텍스트 레이어(PyMuPDF) + 표(pdfplumber) + OCR(Tesseract) 병합 |
-| 트랜스포머 임베딩 | BAAI/bge-m3 Dense 임베딩 (한국어+영어, 의미 기반 검색) |
+| 임베딩 | OpenAI Embeddings (text-embedding-3-small 등) |
 | 벡터 검색 | ChromaDB 코사인 유사도 검색 |
 | LLM 답변 | Google Gemini 기반 자연어 답변 |
 | 필터링 | 부문별(R&D/SI), 연도별 검색 필터 |
@@ -88,16 +88,18 @@ streamlit run app.py
 | 설정 변수 | 기본값 | 설명 |
 |-----------|--------|------|
 | `GOOGLE_API_KEY` | (필수) | Google AI Studio API 키 |
+| `OPENAI_API_KEY` | (필수) | OpenAI API 키 (임베딩용) |
 | `DATA_DIR` | `C:\Users\User\Downloads\제안서` | PDF 폴더 경로 |
 | `GEMINI_MODEL` | `gemini-2.0-flash` | Gemini LLM 모델명 |
-| `EMBEDDING_MODEL` | `BAAI/bge-m3` | 임베딩 모델명 |
+| `EMBEDDING_PROVIDER` | `openai` | 임베딩 제공자 (`openai`/`local`) |
+| `EMBEDDING_MODEL` | `text-embedding-3-small` | 임베딩 모델명 |
 | `OCR_ENABLED` | `true` | OCR 활성화 여부 |
 
 ## 🔬 기술 스택 (발표자료 기반)
 
 | 구분 | 사용 기술 | 발표자료 분류 |
 |------|-----------|-------------|
-| 임베딩 | BAAI/bge-m3 | Transformer Encoder-Only (Dense) |
+| 임베딩 | OpenAI Embeddings | API 기반 임베딩 |
 | 벡터DB | ChromaDB | 코사인 유사도 검색 |
 | LLM | Google Gemini | Decoder-Only |
 | PDF 파싱 | PyMuPDF + pdfplumber | - |

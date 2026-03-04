@@ -40,17 +40,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from langchain_core.documents import Document
 import chromadb
 
-# chromadb 1.5.x에서 임베딩 함수 import 경로 변경 대응
-try:
-    # chromadb >= 1.5.x: 각 임베딩 함수가 별도 모듈로 분리됨
-    from chromadb.utils.embedding_functions.sentence_transformer_embedding_function import (
-        SentenceTransformerEmbeddingFunction,
-    )
-except ImportError:
-    # chromadb < 1.5.x 하위 호환
-    from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
-
-from config import VECTORSTORE_DIR, EMBEDDING_MODEL, EMBEDDING_BATCH_SIZE, TOP_K_RESULTS
+from config import (
+    VECTORSTORE_DIR,
+    EMBEDDING_PROVIDER,
+    OPENAI_API_KEY,
+    EMBEDDING_MODEL,
+    EMBEDDING_BATCH_SIZE,
+    TOP_K_RESULTS,
+)
 
 
 # ──────────────────────────────────────────────
@@ -63,26 +60,40 @@ COLLECTION_NAME = "proposals"
 CHROMA_DIR = VECTORSTORE_DIR / "chroma_db"
 
 
-def _get_embedding_function() -> SentenceTransformerEmbeddingFunction:
+def _get_embedding_function():
     """
-    트랜스포머 기반 임베딩 함수 반환
-
-    [ 임베딩 모델: BAAI/bge-m3 ]
-    - 구조: Transformer Encoder-Only (BERT 계열)
-    - 방식: Dense Embedding (Mean Pooling)
-    - 특징: 한국어+영어 동시 처리, 의미 기반 유사도 검색 가능
-    - 최초 실행 시 Hugging Face에서 자동 다운로드 (~2GB)
-    - 대안(경량): "jhgan/ko-sroberta-multitask" (~400MB)
-
-    Returns:
-        ChromaDB 호환 임베딩 함수 (SentenceTransformerEmbeddingFunction)
+    임베딩 함수 반환 (OpenAI API 또는 로컬 모델)
     """
-    print(f"[EMB] 임베딩 모델 로드: {EMBEDDING_MODEL}")
-    print(f"      (최초 실행 시 모델 다운로드가 필요합니다 - ~2GB)")
+    if EMBEDDING_PROVIDER == "openai":
+        if not OPENAI_API_KEY:
+            raise ValueError(
+                "OPENAI_API_KEY가 설정되어 있지 않습니다. "
+                ".env에 OPENAI_API_KEY를 추가하세요."
+            )
+        # chromadb의 OpenAI 임베딩 함수 사용
+        from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
+
+        print(f"[EMB] OpenAI 임베딩 사용: {EMBEDDING_MODEL}")
+        return OpenAIEmbeddingFunction(
+            api_key=OPENAI_API_KEY,
+            model_name=EMBEDDING_MODEL,
+        )
+
+    # 로컬 임베딩 (bge-m3 등)
+    print(f"[EMB] 로컬 임베딩 모델 로드: {EMBEDDING_MODEL}")
+    print("      (최초 실행 시 모델 다운로드가 필요합니다)")
+
+    # chromadb 1.5.x에서 임베딩 함수 import 경로 변경 대응
+    try:
+        from chromadb.utils.embedding_functions.sentence_transformer_embedding_function import (
+            SentenceTransformerEmbeddingFunction,
+        )
+    except ImportError:
+        from chromadb.utils.embedding_functions import SentenceTransformerEmbeddingFunction
+
     return SentenceTransformerEmbeddingFunction(
         model_name=EMBEDDING_MODEL,
         batch_size=EMBEDDING_BATCH_SIZE,
-        # normalize_embeddings: 코사인 유사도 계산을 위해 L2 정규화 적용
         normalize_embeddings=True,
     )
 

@@ -41,14 +41,25 @@ GOOGLE_API_KEY: str | None = os.getenv("GOOGLE_API_KEY")
 GEMINI_MODEL: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
 # ──────────────────────────────────────────────
-# 임베딩 모델 설정 (트랜스포머 기반)
+# 임베딩 설정 (API 또는 로컬)
 # ──────────────────────────────────────────────
-# [ 발표자료 참고: Transformer 기반 Dense 임베딩 ]
-# bge-m3: BAAI에서 개발한 다국어 Dense+Sparse 하이브리드 모델
-#         한국어 포함 100+ 언어 지원, 의미 기반 유사도 검색 가능
-# 최초 실행 시 Hugging Face에서 자동 다운로드 (~2GB)
-# 대안(경량): "jhgan/ko-sroberta-multitask" (~400MB, 한국어 전용)
-EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
+# EMBEDDING_PROVIDER:
+#   - "openai": OpenAI Embeddings API 사용 (권장)
+#   - "local" : 로컬 임베딩 모델 사용 (bge-m3 등)
+EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", "openai").lower()
+
+# OpenAI API 키 (EMBEDDING_PROVIDER=openai일 때 필요)
+OPENAI_API_KEY: str | None = os.getenv("OPENAI_API_KEY")
+
+# 임베딩 모델명
+# - OpenAI 권장: text-embedding-3-small / text-embedding-3-large
+# - 로컬 권장: BAAI/bge-m3
+_DEFAULT_EMBEDDING_MODEL = (
+    "text-embedding-3-small"
+    if EMBEDDING_PROVIDER == "openai"
+    else "BAAI/bge-m3"
+)
+EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", _DEFAULT_EMBEDDING_MODEL)
 
 # 임베딩 벡터 배치 처리 크기 (메모리 부족 시 줄임)
 EMBEDDING_BATCH_SIZE: int = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))

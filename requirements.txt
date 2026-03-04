@@ -4,13 +4,11 @@
 langchain>=0.1.0
 langchain-google-genai>=1.0.0
 langchain-community>=0.0.20
-langchain-text-splitters>=0.0.1
 
 # ───────────────────────────────────────────
-# 트랜스포머 임베딩 (발표자료 권장: BAAI/bge-m3)
-# 최초 설치 후 모델 자동 다운로드 (~2GB)
+# OpenAI API (임베딩)
 # ───────────────────────────────────────────
-sentence-transformers>=2.7.0
+openai>=1.0.0
 
 # ───────────────────────────────────────────
 # 벡터 데이터베이스
