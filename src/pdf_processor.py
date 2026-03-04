@@ -84,9 +84,11 @@ class ProcessedDocument:
     Attributes:
         metadata: DocumentMetadata (파일 정보)
         pages:    PageContent 리스트 (페이지별 텍스트)
+        stats:    추출 통계 (OCR/표/텍스트 페이지 수 등)
     """
     metadata: DocumentMetadata
     pages:    list[PageContent] = field(default_factory=list)
+    stats:    dict[str, int] = field(default_factory=dict)
 
 
 # ──────────────────────────────────────────────
@@ -174,7 +176,7 @@ def _extract_tables_by_page(file_path: Path) -> dict[int, str]:
     return tables_by_page
 
 
-def extract_pages_from_pdf(file_path: Path) -> tuple[list[PageContent], int]:
+def extract_pages_from_pdf(file_path: Path) -> tuple[list[PageContent], int, dict[str, int]]:
     """
     PDF의 모든 페이지에서 텍스트를 추출하여 PageContent 리스트로 반환
 
@@ -188,7 +190,7 @@ def extract_pages_from_pdf(file_path: Path) -> tuple[list[PageContent], int]:
         file_path: PDF 파일 경로
 
     Returns:
-        tuple: (PageContent 리스트, 총 페이지 수)
+        tuple: (PageContent 리스트, 총 페이지 수, 추출 통계)
     """
     # OCR 설정 로드 (임포트를 함수 내부로 배치해 순환 참조 방지)
     from config import OCR_ENABLED, OCR_LANG, OCR_MIN_TEXT_CHARS, TESSERACT_CMD
@@ -199,6 +201,13 @@ def extract_pages_from_pdf(file_path: Path) -> tuple[list[PageContent], int]:
     tables_by_page = _extract_tables_by_page(file_path)
 
     pages: list[PageContent] = []
+    stats = {
+        "text_pages": 0,
+        "table_pages": 0,
+        "ocr_pages": 0,
+        "extracted_pages": 0,
+        "total_chars": 0,
+    }
     try:
         fitz_doc = fitz.open(file_path)
         total_pages = len(fitz_doc)
@@ -206,9 +215,13 @@ def extract_pages_from_pdf(file_path: Path) -> tuple[list[PageContent], int]:
         for page_num, fitz_page in enumerate(fitz_doc, 1):
             # Step 2: 텍스트 레이어 추출
             page_text = fitz_page.get_text()
+            if page_text.strip():
+                stats["text_pages"] += 1
 
             # Step 3: 표 텍스트 (pdfplumber 결과 병합)
             table_text = tables_by_page.get(page_num, "")
+            if table_text.strip():
+                stats["table_pages"] += 1
 
             # Step 4: OCR (스캔 PDF 대응)
             ocr_text = ""
@@ -220,6 +233,8 @@ def extract_pages_from_pdf(file_path: Path) -> tuple[list[PageContent], int]:
                     ocr_text = pytesseract.image_to_string(img, lang=OCR_LANG)
                 except Exception as e:
                     print(f"[WARN] OCR 실패 ({file_path.name} p{page_num}): {e}")
+            if ocr_text.strip():
+                stats["ocr_pages"] += 1
 
             # 3가지 결과 결합 (섹션 구분자로 LLM 인식 용이)
             parts = []
@@ -233,13 +248,15 @@ def extract_pages_from_pdf(file_path: Path) -> tuple[list[PageContent], int]:
             combined = "\n\n".join(parts).strip()
             if combined:
                 pages.append(PageContent(page_number=page_num, content=combined))
+                stats["extracted_pages"] += 1
+                stats["total_chars"] += len(combined)
 
         fitz_doc.close()
-        return pages, total_pages
+        return pages, total_pages, stats
 
     except Exception as e:
         print(f"[ERROR] PDF 처리 오류 ({file_path.name}): {e}")
-        return [], 0
+        return [], 0, stats
 
 
 # ──────────────────────────────────────────────
@@ -261,13 +278,13 @@ def process_pdf(file_path: Path, department: str) -> ProcessedDocument | None:
         ProcessedDocument 또는 추출 실패 시 None
     """
     metadata = extract_metadata_from_filename(file_path, department)
-    pages, total_pages = extract_pages_from_pdf(file_path)
+    pages, total_pages, stats = extract_pages_from_pdf(file_path)
 
     if not pages:
         return None
 
     metadata.total_pages = total_pages
-    return ProcessedDocument(metadata=metadata, pages=pages)
+    return ProcessedDocument(metadata=metadata, pages=pages, stats=stats)
 
 
 def process_all_pdfs(data_dir: Path) -> list[ProcessedDocument]:

@@ -125,6 +125,7 @@ class RAGChain:
         question: str,
         department: str | None = None,
         year: str | None = None,
+        file_name: str | None = None,
     ) -> tuple[str, list[Document], dict]:
         """
         사용자 질문에 대한 RAG 기반 답변 생성
@@ -143,6 +144,7 @@ class RAGChain:
             "original_query": question,
             "department_filter": department or "전체",
             "year_filter": year or "전체",
+            "file_filter": file_name or "전체",
             "page_filter": page_number,
         }
 
@@ -152,6 +154,7 @@ class RAGChain:
             collection=self.vectorstore,
             department=department,
             year=year,
+            file_name=file_name,
             page_number=page_number,
         )
 

@@ -30,6 +30,9 @@ DATA_DIR: Path = Path(os.getenv("DATA_DIR", r"C:\Users\User\Downloads\제안서"
 # 벡터스토어(임베딩 인덱스) 저장 디렉토리
 VECTORSTORE_DIR: Path = PROJECT_ROOT / "vectorstore"
 
+# 인덱싱 로그 저장 디렉토리
+INDEX_LOG_DIR: Path = VECTORSTORE_DIR / "index_logs"
+
 # ──────────────────────────────────────────────
 # Google Gemini API 설정
 # ──────────────────────────────────────────────

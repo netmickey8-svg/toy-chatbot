@@ -35,6 +35,7 @@ from config import DATA_DIR, VECTORSTORE_DIR
 from src.pdf_processor import process_all_pdfs
 from src.chunker import chunk_all_documents
 from src.vectordb import create_vectorstore
+from src.index_logs import write_index_logs
 
 
 def main() -> None:
@@ -48,7 +49,7 @@ def main() -> None:
     print("=" * 60)
 
     # ── Step 1: PDF 처리 ─────────────────────────────
-    print("\n[Step 1/3] PDF 텍스트 추출 (텍스트 레이어 + 표 + OCR)")
+    print("\n[Step 1/4] PDF 텍스트 추출 (텍스트 레이어 + 표 + OCR)")
     documents = process_all_pdfs(DATA_DIR)
     if not documents:
         print("[ERROR] 처리된 문서가 없습니다. DATA_DIR 경로를 확인하세요.")
@@ -56,14 +57,17 @@ def main() -> None:
         return
 
     # ── Step 2: 청킹 ─────────────────────────────────
-    print(f"\n[Step 2/3] 청킹 ({len(documents)}개 문서 → 800자 단위 분할)")
+    print(f"\n[Step 2/4] 청킹 ({len(documents)}개 문서 → 800자 단위 분할)")
     chunks = chunk_all_documents(documents)
     if not chunks:
         print("[ERROR] 청크가 생성되지 않았습니다.")
         return
 
-    # ── Step 3: 임베딩 & 저장 ─────────────────────────
-    print(f"\n[Step 3/3] bge-m3 임베딩 생성 및 ChromaDB 저장 ({len(chunks)}개 청크)")
+    # ── Step 3: 인덱싱 로그 저장 ──────────────────────
+    write_index_logs(documents, chunks)
+
+    # ── Step 4: 임베딩 & 저장 ─────────────────────────
+    print(f"\n[Step 4/4] bge-m3 임베딩 생성 및 ChromaDB 저장 ({len(chunks)}개 청크)")
     create_vectorstore(chunks)
 
     # ── 완료 ──────────────────────────────────────────

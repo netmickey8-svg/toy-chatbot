@@ -8,7 +8,8 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.rag_chain import RAGChain
-from src.vectordb import load_vectorstore
+from src.vectordb import get_indexed_file_names
+from src.index_logs import load_index_log
 
 
 # 페이지 설정
@@ -63,6 +64,31 @@ def load_rag_chain():
         with st.spinner("🔄 챗봇을 초기화하는 중..."):
             st.session_state.rag_chain = RAGChain()
     return st.session_state.rag_chain
+
+
+def render_index_log(log: dict) -> None:
+    """인덱싱 로그 표시"""
+    if not log:
+        st.info("인덱싱 로그를 찾을 수 없습니다.")
+        return
+
+    st.markdown(
+        f"**파일명:** {log.get('file_name', '-')}\n\n"
+        f"**부문/연도:** {log.get('department', '-')} / {log.get('year', '-')}\n\n"
+        f"**페이지:** {log.get('extracted_pages', 0)}/{log.get('total_pages', 0)}\n\n"
+        f"**텍스트/표/OCR 페이지:** "
+        f"{log.get('text_pages', 0)}/{log.get('table_pages', 0)}/{log.get('ocr_pages', 0)}\n\n"
+        f"**총 문자수:** {log.get('total_chars', 0):,}\n\n"
+        f"**총 청크:** {log.get('total_chunks', 0)}\n\n"
+        f"**인덱싱 시각(UTC):** {log.get('indexed_at', '-')}"
+    )
+
+    chunks_per_page = log.get("chunks_per_page", {})
+    if chunks_per_page:
+        lines = []
+        for page in sorted(chunks_per_page.keys(), key=lambda x: int(x)):
+            lines.append(f"p{page}: {chunks_per_page[page]}")
+        st.code("\n".join(lines), language=None)
 
 
 def display_pipeline_info(pipeline_info: dict):
@@ -163,6 +189,9 @@ def main():
     st.markdown('<h1 class="main-header">📄 제안서 챗봇</h1>', unsafe_allow_html=True)
     st.markdown("---")
 
+    # RAG 체인 로드
+    rag = load_rag_chain()
+
     # 사이드바 - 필터 옵션
     with st.sidebar:
         st.header("🔍 검색 필터")
@@ -179,6 +208,21 @@ def main():
             index=0
         )
 
+        file_options = ["전체"]
+        indexed_files = []
+        try:
+            indexed_files = get_indexed_file_names(rag.vectorstore)
+        except Exception:
+            indexed_files = []
+        if indexed_files:
+            file_options += indexed_files
+
+        file_name = st.selectbox(
+            "파일 선택",
+            options=file_options,
+            index=0
+        )
+
         st.markdown("---")
         st.markdown("""
         ### 💡 사용 예시
@@ -192,9 +236,6 @@ def main():
         if st.button("🗑️ 대화 기록 삭제"):
             st.session_state.messages = []
             st.rerun()
-
-    # RAG 체인 로드
-    rag = load_rag_chain()
 
     # 벡터스토어 확인
     if not rag.is_ready():
@@ -225,6 +266,7 @@ def main():
         # 필터 설정
         dept_filter = None if department == "전체" else department
         year_filter = None if year == "전체" else year
+        file_filter = None if file_name == "전체" else file_name
 
         # AI 응답 생성
         with st.chat_message("assistant"):
@@ -232,7 +274,8 @@ def main():
                 answer, docs, pipeline_info = rag.ask(
                     question=prompt,
                     department=dept_filter,
-                    year=year_filter
+                    year=year_filter,
+                    file_name=file_filter,
                 )
 
             st.markdown(answer)
@@ -251,6 +294,20 @@ def main():
                             📁 {meta.get('department', '')} | 📅 {meta.get('year', '')}년 | 📄 {meta.get('page_number', '')}p
                         </div>
                         """, unsafe_allow_html=True)
+
+            # 인덱싱 로그 표시
+            if docs:
+                file_names = []
+                for doc in docs:
+                    name = doc.metadata.get("file_name")
+                    if name and name not in file_names:
+                        file_names.append(name)
+                if file_names:
+                    with st.expander("🧾 인덱싱 로그"):
+                        for name in file_names:
+                            log = load_index_log(name)
+                            render_index_log(log)
+                            st.markdown("---")
 
         st.session_state.messages.append({
             "role": "assistant",

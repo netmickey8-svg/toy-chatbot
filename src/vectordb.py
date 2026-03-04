@@ -212,6 +212,7 @@ def search_documents(
     collection: chromadb.Collection | None = None,
     department: str | None = None,
     year: str | None = None,
+    file_name: str | None = None,
     page_number: int | None = None,
     k: int = TOP_K_RESULTS,
 ) -> list[Document]:
@@ -247,6 +248,8 @@ def search_documents(
         conditions.append({"department": {"$eq": department}})
     if year:
         conditions.append({"year": {"$eq": str(year)}})
+    if file_name:
+        conditions.append({"file_name": {"$eq": file_name}})
     if page_number is not None:
         conditions.append({"page_number": {"$eq": page_number}})
 
@@ -279,6 +282,49 @@ def search_documents(
             docs.append(Document(page_content=text, metadata=doc_meta))
 
     return docs
+
+
+def get_indexed_file_names(
+    collection: chromadb.Collection | None = None,
+    batch_size: int = 5000,
+) -> list[str]:
+    """
+    벡터스토어에 저장된 파일명 목록을 반환
+    """
+    if collection is None:
+        collection = load_vectorstore()
+        if collection is None:
+            return []
+
+    try:
+        total = collection.count()
+    except Exception:
+        return []
+
+    file_names: set[str] = set()
+    offset = 0
+
+    while offset < total:
+        try:
+            result = collection.get(
+                include=["metadatas"],
+                limit=min(batch_size, total - offset),
+                offset=offset,
+            )
+        except Exception:
+            break
+
+        metadatas = result.get("metadatas", []) if result else []
+        for meta in metadatas:
+            if not meta:
+                continue
+            name = meta.get("file_name")
+            if name:
+                file_names.add(name)
+
+        offset += batch_size
+
+    return sorted(file_names)
 
 
 # ──────────────────────────────────────────────
