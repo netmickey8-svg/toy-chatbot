@@ -4,17 +4,32 @@
 import streamlit as st
 from pathlib import Path
 import re
+import logging
+import traceback
+import faulthandler
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
 from src.rag_chain import RAGChain
-from src.vectordb import get_indexed_file_names, upsert_vectorstore
+from src.vectordb import upsert_vectorstore, get_indexed_file_names
 from src.pdf_processor import process_pdf
 from src.chunker import chunk_document
 from src.index_logs import load_index_log, write_index_logs
 from config import DATA_DIR
-from src.index_logs import load_index_log
+
+LOG_PATH = Path(__file__).parent / "app_runtime.log"
+logging.basicConfig(
+    filename=str(LOG_PATH),
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+try:
+    _fh = open(LOG_PATH, "a", encoding="utf-8")
+    faulthandler.enable(_fh)
+except Exception:
+    pass
+logging.info("app.py imported")
 
 
 # 페이지 설정
@@ -63,13 +78,39 @@ def initialize_session_state():
         st.session_state.rag_chain = None
     if "last_chunk_preview" not in st.session_state:
         st.session_state.last_chunk_preview = []
+    if "rag_init_error" not in st.session_state:
+        st.session_state.rag_init_error = None
+
+
+class SafeRAGFallback:
+    """초기화 실패 시 UI가 죽지 않도록 하는 폴백 객체"""
+
+    def __init__(self, error: Exception) -> None:
+        self.vectorstore = None
+        self._error = str(error)
+
+    def is_ready(self) -> bool:
+        return False
+
+    def ask(self, *args, **kwargs):
+        return (
+            f"초기화 실패로 답변할 수 없습니다: {self._error}",
+            [],
+            {"generation": {"status": f"초기화 실패: {self._error}"}},
+        )
 
 
 def load_rag_chain():
     """RAG 체인 로드"""
     if st.session_state.rag_chain is None:
         with st.spinner("🔄 챗봇을 초기화하는 중..."):
-            st.session_state.rag_chain = RAGChain()
+            try:
+                st.session_state.rag_chain = RAGChain()
+                st.session_state.rag_init_error = None
+            except Exception as e:
+                st.session_state.rag_init_error = str(e)
+                st.session_state.rag_chain = SafeRAGFallback(e)
+                st.error(f"초기화 실패: {e}")
     return st.session_state.rag_chain
 
 
@@ -128,20 +169,23 @@ def display_pipeline_info(pipeline_info: dict):
         qa = pipeline_info.get("query_analysis", {})
         if qa:
             st.markdown("#### 1️⃣ 쿼리 분석")
-            col1, col2, col3 = st.columns(3)
-            col1.metric("부문 필터", qa.get("department_filter", "-"))
-            col2.metric("연도 필터", qa.get("year_filter", "-"))
-            col3.metric("페이지 필터", qa.get("page_filter") or "없음")
+            st.metric("페이지 필터", qa.get("page_filter") or "없음")
             st.code(f"원본 쿼리: {qa.get('original_query', '')}", language=None)
             st.divider()
 
         # ── Step 2: 검색 결과 ────────────────────
         ret = pipeline_info.get("retrieval", {})
         if ret:
-            st.markdown("#### 2️⃣ Dense Retrieval (벡터 검색)")
-            col1, col2 = st.columns(2)
+            st.markdown("#### 2️⃣ Retrieval")
+            col1, col2, col3 = st.columns(3)
             col1.metric("임베딩 모델", ret.get("model", ""))
             col2.metric("검색된 청크", f"{ret.get('results_count', 0)}개")
+            col3.metric("검색 모드", ret.get("retriever_mode", "dense"))
+            if ret.get("retriever_mode") in {"hybrid", "hybrid_cluster"}:
+                st.caption(
+                    f"dense={ret.get('dense_weight')} / sparse={ret.get('sparse_weight')} | "
+                    f"cluster={ret.get('cluster_enabled')} ({ret.get('clusters')}개)"
+                )
 
             chunks = ret.get("chunks", [])
             if chunks:
@@ -150,12 +194,21 @@ def display_pipeline_info(pipeline_info: dict):
                     sim = chunk.get("similarity", 0)
                     sim_pct = f"{sim * 100:.1f}%"
                     with st.container():
-                        st.markdown(
+                        line = (
                             f"**#{chunk['rank']}** | 유사도: `{sim_pct}` | "
                             f"📄 {chunk.get('file_name', '?')[:40]} | "
                             f"{chunk.get('department', '')} | "
                             f"{chunk.get('year', '')}년 p{chunk.get('page', '-')}"
                         )
+                        if chunk.get("hybrid_score") is not None:
+                            line += (
+                                f" | d={chunk.get('dense_score')} "
+                                f"s={chunk.get('sparse_score')} "
+                                f"h={chunk.get('hybrid_score')}"
+                            )
+                        if chunk.get("cluster_id") is not None:
+                            line += f" | cluster={chunk.get('cluster_id')}"
+                        st.markdown(line)
                         st.text(chunk.get("preview", ""))
                         st.markdown("---")
             st.divider()
@@ -210,6 +263,7 @@ def display_chat_history():
 
 def main():
     """메인 앱"""
+    logging.info("main() start")
     initialize_session_state()
 
     # 헤더
@@ -218,80 +272,74 @@ def main():
 
     # RAG 체인 로드
     rag = load_rag_chain()
+    logging.info("rag loaded; ready=%s", getattr(rag, "is_ready", lambda: False)())
 
-    # 사이드바 - 필터 옵션
+    # 사이드바
     with st.sidebar:
         st.header("📥 PDF 업로드")
-        uploaded_file = st.file_uploader("PDF 파일 업로드", type=["pdf"])
-        if uploaded_file:
-            auto_department = infer_department(uploaded_file.name)
-            st.caption(f"자동 분류: {auto_department}")
-            if st.button("업로드 및 인덱싱"):
+        uploaded_files = st.file_uploader("PDF 파일 업로드", type=["pdf"], accept_multiple_files=True)
+        if uploaded_files:
+            st.caption(f"선택된 파일: {len(uploaded_files)}개")
+            if st.button("선택 파일 인덱싱"):
                 try:
-                    saved_path = save_uploaded_pdf(uploaded_file, auto_department)
-                    doc = process_pdf(saved_path, auto_department)
-                    if not doc:
-                        st.error("PDF 텍스트 추출에 실패했습니다.")
-                    else:
+                    all_docs = []
+                    all_chunks = []
+                    overwrite_files = []
+                    preview = []
+
+                    for uploaded_file in uploaded_files:
+                        auto_department = infer_department(uploaded_file.name)
+                        saved_path = save_uploaded_pdf(uploaded_file, auto_department)
+                        doc = process_pdf(saved_path, auto_department)
+                        if not doc:
+                            continue
                         chunks = chunk_document(doc)
                         if not chunks:
-                            st.error("청크 생성에 실패했습니다.")
-                        else:
-                            rag.vectorstore = upsert_vectorstore(
-                                chunks,
-                                rag.vectorstore,
-                                overwrite_files=[doc.metadata.file_name],
+                            continue
+                        all_docs.append(doc)
+                        all_chunks.extend(chunks)
+                        overwrite_files.append(doc.metadata.file_name)
+                        for chunk in chunks[:3]:
+                            meta = chunk.metadata or {}
+                            preview.append(
+                                {
+                                    "page_number": meta.get("page_number", "-"),
+                                    "length": len(chunk.page_content),
+                                    "text": (
+                                        chunk.page_content[:300] + "..."
+                                        if len(chunk.page_content) > 300
+                                        else chunk.page_content
+                                    ),
+                                }
                             )
-                            write_index_logs([doc], chunks)
-                            preview = []
-                            for chunk in chunks[:10]:
-                                meta = chunk.metadata or {}
-                                preview.append(
-                                    {
-                                        "page_number": meta.get("page_number", "-"),
-                                        "length": len(chunk.page_content),
-                                        "text": (
-                                            chunk.page_content[:300] + "..."
-                                            if len(chunk.page_content) > 300
-                                            else chunk.page_content
-                                        ),
-                                    }
-                                )
-                            st.session_state.last_chunk_preview = preview
-                            st.success("업로드 및 인덱싱 완료")
-                            st.rerun()
+
+                    if not all_chunks:
+                        st.error("인덱싱 가능한 텍스트를 찾지 못했습니다.")
+                    else:
+                        rag.vectorstore = upsert_vectorstore(
+                            all_chunks,
+                            rag.vectorstore,
+                            overwrite_files=overwrite_files,
+                        )
+                        write_index_logs(all_docs, all_chunks)
+                        rag.refresh_retriever()
+                        st.session_state.last_chunk_preview = preview[:10]
+                        st.success(f"인덱싱 완료: 파일 {len(all_docs)}개, 청크 {len(all_chunks)}개")
+                        st.rerun()
                 except Exception as e:
                     st.error(f"업로드/인덱싱 오류: {e}")
 
         st.markdown("---")
-        st.header("🔍 검색 필터")
-
-        department = st.selectbox(
-            "부문 선택",
-            options=["전체", "R&D부문", "SI부문"],
-            index=0
-        )
-
-        year = st.selectbox(
-            "연도 선택",
-            options=["전체", "2024", "2025", "2026"],
-            index=0
-        )
-
-        file_options = ["전체"]
-        indexed_files = []
+        st.header("📚 인덱싱된 파일")
         try:
-            indexed_files = get_indexed_file_names(rag.vectorstore)
-        except Exception:
-            indexed_files = []
-        if indexed_files:
-            file_options += indexed_files
-
-        file_name = st.selectbox(
-            "파일 선택",
-            options=file_options,
-            index=0
-        )
+            names = get_indexed_file_names(rag.vectorstore)
+            st.caption(f"총 {len(names)}개")
+            if names:
+                with st.expander("파일 목록 보기", expanded=False):
+                    for n in names:
+                        st.write(f"- {n}")
+        except Exception as e:
+            st.caption(f"파일 목록 조회 실패: {e}")
 
         st.markdown("---")
         st.markdown("""
@@ -343,19 +391,11 @@ def main():
             "content": prompt
         })
 
-        # 필터 설정
-        dept_filter = None if department == "전체" else department
-        year_filter = None if year == "전체" else year
-        file_filter = None if file_name == "전체" else file_name
-
         # AI 응답 생성
         with st.chat_message("assistant"):
             with st.spinner("🤔 답변을 생성하는 중..."):
                 answer, docs, pipeline_info = rag.ask(
                     question=prompt,
-                    department=dept_filter,
-                    year=year_filter,
-                    file_name=file_filter,
                 )
 
             st.markdown(answer)
@@ -398,4 +438,19 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # python app.py 로 직접 실행하면 서버가 바로 종료되는 것처럼 보일 수 있어 명확히 안내
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        if get_script_run_ctx() is None:
+            print("이 앱은 직접 실행이 아니라 아래 명령으로 실행해야 합니다:")
+            print("python -m streamlit run app.py --server.fileWatcherType none")
+            raise SystemExit(0)
+    except ImportError:
+        pass
+
+    try:
+        main()
+    except Exception as e:
+        logging.error("Unhandled exception: %s", e)
+        logging.error(traceback.format_exc())
+        raise

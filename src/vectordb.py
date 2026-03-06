@@ -1,90 +1,331 @@
 """
 벡터스토어 관리 모듈
 ====================
-역할:
-    - PDF에서 추출된 텍스트 청크를 트랜스포머 임베딩으로 변환하여 벡터DB에 저장
-    - 사용자 쿼리를 임베딩하여 유사 청크를 검색(Dense Retrieval)하는 기능 제공
-
-핵심 기술 (발표자료 참고):
-    ┌──────────────────────────────────────────────────────────┐
-    │  [Query 단계]                                             │
-    │   쿼리 → Embedding → ChromaDB 벡터 검색 → 상위 K개 반환  │
-    │                                                          │
-    │  [임베딩 모델]                                            │
-    │   BAAI/bge-m3 (Transformer Encoder-Only, Dense 방식)     │
-    │   - 한국어 포함 100+ 언어 지원                            │
-    │   - Mean Pooling으로 문장 임베딩 생성                     │
-    │   - 의미 기반 검색 (TF-IDF 키워드 매칭보다 정확)          │
-    └──────────────────────────────────────────────────────────┘
-
-파일 구조:
-    vectorstore/
-    └── chroma_db/    ← ChromaDB 영구 저장소 (git 제외)
-
-사용법:
-    # 인덱싱 (index_data.py에서 호출)
-    store = create_vectorstore(chunks)
-
-    # 검색 (rag_chain.py에서 호출)
-    docs = search_documents(query="블록체인", department="R&D부문")
+기본 백엔드: Qdrant(원격)
+보조 백엔드: simple(로컬 JSON, 디버그용)
 """
 
 from __future__ import annotations
 
-import sys
 import hashlib
+import json
 from pathlib import Path
+from typing import Any
 
-# 프로젝트 루트를 import 경로에 추가 (어디서 실행해도 동작하도록)
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
+import numpy as np
 from langchain_core.documents import Document
-import chromadb
+from openai import OpenAI
+from qdrant_client import QdrantClient, models
 
 from config import (
     VECTORSTORE_DIR,
+    VECTOR_BACKEND,
+    QDRANT_URL,
+    QDRANT_API_KEY,
+    QDRANT_COLLECTION,
     EMBEDDING_PROVIDER,
     OPENAI_API_KEY,
     EMBEDDING_MODEL,
+    EMBEDDING_BASE_URL,
+    EMBEDDING_API_KEY,
+    EMBEDDING_HASH_DIM,
     EMBEDDING_BATCH_SIZE,
     TOP_K_RESULTS,
 )
 
 
-# ──────────────────────────────────────────────
-# ChromaDB 컬렉션 설정
-# ──────────────────────────────────────────────
-# 컬렉션명: 벡터스토어 내 문서 그룹 식별자
-COLLECTION_NAME = "proposals"
+SIMPLE_STORE_FILE = VECTORSTORE_DIR / "simple_store.json"
 
-# ChromaDB 저장 경로
-CHROMA_DIR = VECTORSTORE_DIR / "chroma_db"
+
+def _use_simple_backend() -> bool:
+    return VECTOR_BACKEND == "simple"
+
+
+def _meta_match(meta: dict, where: dict | None) -> bool:
+    if not where:
+        return True
+    if "$and" in where:
+        return all(_meta_match(meta, cond) for cond in where["$and"])
+    for key, cond in where.items():
+        if isinstance(cond, dict) and "$eq" in cond:
+            if str(meta.get(key)) != str(cond["$eq"]):
+                return False
+        elif meta.get(key) != cond:
+            return False
+    return True
+
+
+class SimpleCollection:
+    """Qdrant 대체용 최소 로컬 컬렉션"""
+
+    def __init__(self, file_path: Path, embedding_fn) -> None:
+        self.file_path = file_path
+        self.embedding_fn = embedding_fn
+        self._rows: list[dict[str, Any]] = []
+        self._load()
+
+    def _load(self) -> None:
+        if not self.file_path.exists():
+            self._rows = []
+            return
+        try:
+            data = json.loads(self.file_path.read_text(encoding="utf-8"))
+            self._rows = data if isinstance(data, list) else []
+        except Exception:
+            self._rows = []
+
+    def _save(self) -> None:
+        self.file_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.file_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self._rows, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(self.file_path)
+
+    def count(self) -> int:
+        return len(self._rows)
+
+    def get_corpus(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for r in self._rows:
+            rows.append(
+                {
+                    "id": r.get("id"),
+                    "document": r.get("document", ""),
+                    "metadata": dict(r.get("metadata", {})),
+                    "vector": r.get("vector"),
+                }
+            )
+        return rows
+
+    def upsert(self, ids: list[str], documents: list[str], metadatas: list[dict]) -> None:
+        vectors = self.embedding_fn(documents)
+        by_id = {row["id"]: row for row in self._rows if "id" in row}
+        for i, rid in enumerate(ids):
+            by_id[rid] = {
+                "id": rid,
+                "document": documents[i],
+                "metadata": metadatas[i] if i < len(metadatas) else {},
+                "vector": vectors[i],
+            }
+        self._rows = list(by_id.values())
+        self._save()
+
+    def delete(self, where: dict | None = None) -> None:
+        if not where:
+            self._rows = []
+            self._save()
+            return
+        self._rows = [r for r in self._rows if not _meta_match(r.get("metadata", {}), where)]
+        self._save()
+
+    def query(self, query_text: str, n_results: int) -> list[Document]:
+        if not self._rows:
+            return []
+        emb = np.array([r["vector"] for r in self._rows], dtype=np.float32)
+        emb = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
+        q = np.array(self.embedding_fn([query_text])[0], dtype=np.float32)
+        q = q / (np.linalg.norm(q) + 1e-12)
+        sim = emb @ q
+        top_idx = np.argsort(-sim)[: max(1, min(n_results, len(self._rows)))]
+        docs: list[Document] = []
+        for i in top_idx:
+            row = self._rows[i]
+            meta = dict(row.get("metadata", {}))
+            meta["distance"] = round(float(1 - sim[i]), 4)
+            meta["similarity"] = round(float(sim[i]), 4)
+            docs.append(Document(page_content=row.get("document", ""), metadata=meta))
+        return docs
+
+    def get_indexed_file_names(self) -> list[str]:
+        names = {r.get("metadata", {}).get("file_name") for r in self._rows}
+        return sorted([n for n in names if n])
+
+
+class QdrantCollection:
+    """Qdrant 컬렉션 래퍼 (기존 호출 인터페이스 유지)"""
+
+    def __init__(self, client: QdrantClient, name: str, embedding_fn) -> None:
+        self.client = client
+        self.name = name
+        self.embedding_fn = embedding_fn
+
+    def _ensure_collection(self, vector_size: int) -> None:
+        existing = {c.name for c in self.client.get_collections().collections}
+        if self.name in existing:
+            return
+        self.client.create_collection(
+            collection_name=self.name,
+            vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE),
+        )
+
+    def upsert(self, ids: list[str], documents: list[str], metadatas: list[dict]) -> None:
+        vectors = self.embedding_fn(documents)
+        if not vectors:
+            return
+        self._ensure_collection(len(vectors[0]))
+        points = []
+        for i, pid in enumerate(ids):
+            payload = dict(metadatas[i] if i < len(metadatas) else {})
+            payload["document"] = documents[i]
+            points.append(
+                models.PointStruct(
+                    id=pid,
+                    vector=vectors[i],
+                    payload=payload,
+                )
+            )
+        self.client.upsert(collection_name=self.name, points=points, wait=True)
+
+    def reset(self, vector_size: int) -> None:
+        existing = {c.name for c in self.client.get_collections().collections}
+        if self.name in existing:
+            self.client.delete_collection(collection_name=self.name)
+        self.client.create_collection(
+            collection_name=self.name,
+            vectors_config=models.VectorParams(size=vector_size, distance=models.Distance.COSINE),
+        )
+
+    def delete(self, where: dict | None = None) -> None:
+        if not where:
+            return
+        must: list[models.FieldCondition] = []
+        for key, cond in where.items():
+            if isinstance(cond, dict) and "$eq" in cond:
+                must.append(
+                    models.FieldCondition(
+                        key=key,
+                        match=models.MatchValue(value=cond["$eq"]),
+                    )
+                )
+        if not must:
+            return
+        self.client.delete(
+            collection_name=self.name,
+            points_selector=models.FilterSelector(filter=models.Filter(must=must)),
+            wait=True,
+        )
+
+    def query(self, query_text: str, n_results: int) -> list[Document]:
+        vector = self.embedding_fn([query_text])[0]
+        points = self.client.query_points(
+            collection_name=self.name,
+            query=vector,
+            limit=n_results,
+            with_payload=True,
+        ).points
+        docs: list[Document] = []
+        for p in points:
+            payload = dict(p.payload or {})
+            text = payload.pop("document", "")
+            score = float(p.score) if p.score is not None else 0.0
+            payload["similarity"] = round(score, 4)
+            payload["distance"] = round(1 - score, 4)
+            docs.append(Document(page_content=text, metadata=payload))
+        return docs
+
+    def get_indexed_file_names(self) -> list[str]:
+        names: set[str] = set()
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=self.name,
+                limit=256,
+                with_payload=True,
+                with_vectors=False,
+                offset=offset,
+            )
+            if not points:
+                break
+            for p in points:
+                name = (p.payload or {}).get("file_name")
+                if name:
+                    names.add(name)
+            if offset is None:
+                break
+        return sorted(names)
+
+    def count(self) -> int:
+        try:
+            return self.client.count(collection_name=self.name, exact=False).count
+        except Exception:
+            return 0
+
+    def get_corpus(self) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        offset = None
+        while True:
+            points, offset = self.client.scroll(
+                collection_name=self.name,
+                limit=256,
+                with_payload=True,
+                with_vectors=True,
+                offset=offset,
+            )
+            if not points:
+                break
+            for p in points:
+                payload = dict(p.payload or {})
+                text = payload.pop("document", "")
+                vector = p.vector
+                if isinstance(vector, dict):
+                    # named vector 케이스 대응
+                    vector = next(iter(vector.values())) if vector else None
+                rows.append(
+                    {
+                        "id": str(p.id),
+                        "document": text,
+                        "metadata": payload,
+                        "vector": vector,
+                    }
+                )
+            if offset is None:
+                break
+        return rows
 
 
 def _get_embedding_function():
-    """
-    임베딩 함수 반환 (OpenAI API 또는 로컬 모델)
-    """
     if EMBEDDING_PROVIDER == "openai":
         if not OPENAI_API_KEY:
-            raise ValueError(
-                "OPENAI_API_KEY가 설정되어 있지 않습니다. "
-                ".env에 OPENAI_API_KEY를 추가하세요."
-            )
-        # chromadb의 OpenAI 임베딩 함수 사용
+            raise ValueError("OPENAI_API_KEY가 설정되어 있지 않습니다.")
         from chromadb.utils.embedding_functions import OpenAIEmbeddingFunction
 
         print(f"[EMB] OpenAI 임베딩 사용: {EMBEDDING_MODEL}")
-        return OpenAIEmbeddingFunction(
-            api_key=OPENAI_API_KEY,
-            model_name=EMBEDDING_MODEL,
-        )
+        return OpenAIEmbeddingFunction(api_key=OPENAI_API_KEY, model_name=EMBEDDING_MODEL)
 
-    # 로컬 임베딩 (bge-m3 등)
+    if EMBEDDING_PROVIDER == "remote_openai":
+        print(f"[EMB] 원격 임베딩 사용: {EMBEDDING_MODEL} @ {EMBEDDING_BASE_URL}")
+        client = OpenAI(base_url=EMBEDDING_BASE_URL, api_key=EMBEDDING_API_KEY)
+
+        class RemoteOpenAIEmbeddingFunction:
+            def name(self) -> str:
+                return f"remote-openai-{EMBEDDING_MODEL}"
+
+            def __call__(self, input: list[str]) -> list[list[float]]:
+                texts = [input] if isinstance(input, str) else list(input)
+                resp = client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
+                return [d.embedding for d in sorted(resp.data, key=lambda x: x.index)]
+
+        return RemoteOpenAIEmbeddingFunction()
+
+    if EMBEDDING_PROVIDER == "hashing":
+        from sklearn.feature_extraction.text import HashingVectorizer
+
+        print(f"[EMB] 해시 임베딩 사용: n_features={EMBEDDING_HASH_DIM}")
+
+        class HashingEmbeddingFunction:
+            def __init__(self) -> None:
+                self.vectorizer = HashingVectorizer(
+                    n_features=EMBEDDING_HASH_DIM,
+                    alternate_sign=False,
+                    norm="l2",
+                )
+
+            def __call__(self, input: list[str]) -> list[list[float]]:
+                texts = [input] if isinstance(input, str) else list(input)
+                return self.vectorizer.transform(texts).toarray().tolist()
+
+        return HashingEmbeddingFunction()
+
     print(f"[EMB] 로컬 임베딩 모델 로드: {EMBEDDING_MODEL}")
-    print("      (최초 실행 시 모델 다운로드가 필요합니다)")
-
-    # chromadb 1.5.x에서 임베딩 함수 import 경로 변경 대응
     try:
         from chromadb.utils.embedding_functions.sentence_transformer_embedding_function import (
             SentenceTransformerEmbeddingFunction,
@@ -98,118 +339,52 @@ def _get_embedding_function():
     )
 
 
-def _get_chroma_client() -> chromadb.PersistentClient:
-    """
-    영구 저장 ChromaDB 클라이언트 반환
-
-    역할:
-        - CHROMA_DIR에 데이터를 파일로 저장하여 재시작 후에도 유지
-        - 기존 벡터스토어가 있으면 자동으로 불러옴
-
-    Returns:
-        chromadb.PersistentClient
-    """
-    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
-    return chromadb.PersistentClient(path=str(CHROMA_DIR))
-
-
-def create_vectorstore(chunks: list[Document]) -> chromadb.Collection:
-    """
-    문서 청크를 트랜스포머로 임베딩하여 ChromaDB에 저장
-
-    처리 흐름:
-        청크 리스트
-          → 각 청크 텍스트를 bge-m3 모델로 임베딩 (Dense Vector)
-          → ChromaDB 컬렉션에 upsert (기존 데이터 대체)
-          → CHROMA_DIR에 영구 저장
-
-    Args:
-        chunks: chunker.py에서 생성된 LangChain Document 리스트
-                각 Document는 page_content(텍스트)와 metadata를 포함
-
-    Returns:
-        생성된 chromadb.Collection 객체
-    """
-    print(f"[INFO] {len(chunks)}개 청크를 임베딩하여 저장합니다...")
-    print(f"       저장 위치: {CHROMA_DIR}")
-
-    embedding_fn = _get_embedding_function()
-    client = _get_chroma_client()
-
-    # 기존 컬렉션 삭제 후 재생성 (재인덱싱 시 중복 방지)
-    try:
-        client.delete_collection(COLLECTION_NAME)
-        print(f"[INFO] 기존 컬렉션 삭제 후 재생성")
-    except Exception:
-        pass  # 처음 실행 시 컬렉션이 없으면 무시
-
-    collection = client.create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=embedding_fn,
-        # cosine: 벡터 방향(의미)만 비교, 크기는 무시 → 의미 유사도 검색에 적합
-        metadata={"hnsw:space": "cosine"},
-    )
-
-    # ChromaDB는 문자열 ID가 필요 → 인덱스를 문자열로 변환
-    ids = [str(i) for i in range(len(chunks))]
-    texts = [chunk.page_content for chunk in chunks]
-    # ChromaDB metadata는 str/int/float/bool만 허용 → None 값 제거
-    metadatas = [
-        {k: v for k, v in chunk.metadata.items() if v is not None}
-        for chunk in chunks
-    ]
-
-    # 배치 단위로 upsert (메모리 효율)
-    batch = EMBEDDING_BATCH_SIZE
-    for start in range(0, len(chunks), batch):
-        end = min(start + batch, len(chunks))
-        collection.upsert(
-            ids=ids[start:end],
-            documents=texts[start:end],
-            metadatas=metadatas[start:end],
-        )
-        print(f"  [OK] {end}/{len(chunks)}개 처리 완료")
-
-    print(f"\n[OK] 벡터스토어 생성 완료!")
-    return collection
-
-
-def _ensure_collection(embedding_fn) -> chromadb.Collection:
-    """
-    컬렉션이 없으면 생성, 있으면 로드
-    """
-    client = _get_chroma_client()
-    try:
-        return client.get_collection(
-            name=COLLECTION_NAME,
-            embedding_function=embedding_fn,
-        )
-    except Exception:
-        return client.create_collection(
-            name=COLLECTION_NAME,
-            embedding_function=embedding_fn,
-            metadata={"hnsw:space": "cosine"},
-        )
+def get_embedding_function():
+    """외부 모듈(hybrid retriever)에서 재사용할 임베딩 함수"""
+    return _get_embedding_function()
 
 
 def _chunk_id(meta: dict, chunk_text: str, idx: int) -> str:
-    """
-    청크 고유 ID 생성 (동일 파일 재업로드 시 안정적으로 덮어쓰기)
-    """
     base = f"{meta.get('file_path','')}|{meta.get('page_number','')}|{idx}|{chunk_text[:80]}"
     return hashlib.md5(base.encode("utf-8", errors="ignore")).hexdigest()
 
 
+def _ensure_collection(embedding_fn):
+    if _use_simple_backend():
+        return SimpleCollection(SIMPLE_STORE_FILE, embedding_fn)
+    client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=30.0)
+    return QdrantCollection(client, QDRANT_COLLECTION, embedding_fn)
+
+
+def create_vectorstore(chunks: list[Document]):
+    print(f"[INFO] {len(chunks)}개 청크를 임베딩하여 저장합니다...")
+    # 빈 청크는 검색 품질을 크게 떨어뜨리므로 제외
+    chunks = [c for c in chunks if (c.page_content or "").strip()]
+    if not chunks:
+        raise ValueError("유효한 청크가 없습니다. (빈 텍스트만 존재)")
+
+    embedding_fn = _get_embedding_function()
+    collection = _ensure_collection(embedding_fn)
+    # 전체 재인덱싱: 기존 파일들 모두 삭제 후 업서트
+    if _use_simple_backend():
+        collection.delete(where={})
+    else:
+        # 기존 컬렉션의 잔존/테스트 포인트까지 포함해 완전 초기화
+        sample_vec = embedding_fn([chunks[0].page_content])[0]
+        collection.reset(vector_size=len(sample_vec))
+    return upsert_vectorstore(chunks, collection=collection)
+
+
 def upsert_vectorstore(
     chunks: list[Document],
-    collection: chromadb.Collection | None = None,
+    collection: Any | None = None,
     overwrite_files: list[str] | None = None,
-) -> chromadb.Collection:
-    """
-    청크를 벡터스토어에 증분 업서트
-    """
+) -> Any:
     if not chunks:
         raise ValueError("업서트할 청크가 없습니다.")
+    chunks = [c for c in chunks if (c.page_content or "").strip()]
+    if not chunks:
+        raise ValueError("업서트할 유효 청크가 없습니다. (빈 텍스트)")
 
     embedding_fn = _get_embedding_function()
     if collection is None:
@@ -223,14 +398,8 @@ def upsert_vectorstore(
                 continue
 
     texts = [chunk.page_content for chunk in chunks]
-    metadatas = [
-        {k: v for k, v in (chunk.metadata or {}).items() if v is not None}
-        for chunk in chunks
-    ]
-    ids = [
-        _chunk_id(metadatas[i], texts[i], i)
-        for i in range(len(chunks))
-    ]
+    metadatas = [{k: v for k, v in (chunk.metadata or {}).items() if v is not None} for chunk in chunks]
+    ids = [_chunk_id(metadatas[i], texts[i], i) for i in range(len(chunks))]
 
     batch = EMBEDDING_BATCH_SIZE
     for start in range(0, len(chunks), batch):
@@ -241,37 +410,17 @@ def upsert_vectorstore(
             metadatas=metadatas[start:end],
         )
         print(f"  [OK] {end}/{len(chunks)}개 처리 완료")
-
     return collection
 
 
-def load_vectorstore() -> chromadb.Collection | None:
-    """
-    저장된 ChromaDB 컬렉션 로드
-
-    역할:
-        - 앱 시작 시 호출하여 기존 인덱스를 메모리에 불러옴
-        - 벡터스토어가 없으면 None 반환 (인덱싱 필요 안내용)
-
-    Returns:
-        chromadb.Collection 또는 None (벡터스토어 없을 경우)
-    """
-    if not CHROMA_DIR.exists():
-        print("[WARN] 벡터스토어 없음. 먼저 'python index_data.py'를 실행하세요.")
-        return None
-
+def load_vectorstore() -> Any | None:
     try:
         embedding_fn = _get_embedding_function()
-        client = _get_chroma_client()
-        collection = client.get_collection(
-            name=COLLECTION_NAME,
-            embedding_function=embedding_fn,
-        )
-        count = collection.count()
-        if count == 0:
-            print("[WARN] 벡터스토어가 비어 있습니다. 재인덱싱을 실행하세요.")
+        collection = _ensure_collection(embedding_fn)
+        if collection.count() == 0:
+            print("[WARN] 벡터스토어가 비어 있습니다. 먼저 인덱싱하세요.")
             return None
-        print(f"[OK] 벡터스토어 로드 완료 ({count}개 청크)")
+        print("[OK] 벡터스토어 로드 완료")
         return collection
     except Exception as e:
         print(f"[WARN] 벡터스토어 로드 실패: {e}")
@@ -280,152 +429,48 @@ def load_vectorstore() -> chromadb.Collection | None:
 
 def search_documents(
     query: str,
-    collection: chromadb.Collection | None = None,
-    department: str | None = None,
-    year: str | None = None,
-    file_name: str | None = None,
-    page_number: int | None = None,
+    collection: Any | None = None,
     k: int = TOP_K_RESULTS,
 ) -> list[Document]:
-    """
-    쿼리와 의미적으로 유사한 문서 청크 검색 (Dense Retrieval)
-
-    검색 흐름 (발표자료 Query 단계):
-        쿼리 텍스트
-          → bge-m3로 임베딩 (Dense Vector)
-          → ChromaDB에서 코사인 유사도 기반 상위 K개 검색
-          → 필터 조건(부문/연도/페이지) 적용 후 반환
-
-    Args:
-        query:       사용자 검색 쿼리 (예: "블록체인 관련 프로젝트")
-        collection:  ChromaDB 컬렉션 (None이면 자동 로드)
-        department:  부문 필터 (예: "R&D부문"), None이면 전체 검색
-        year:        연도 필터 (예: "2025"), None이면 전체 검색
-        page_number: 특정 페이지 필터 (None이면 전체 페이지)
-        k:           반환할 최대 문서 수
-
-    Returns:
-        관련도 높은 순으로 정렬된 LangChain Document 리스트
-    """
     if collection is None:
         collection = load_vectorstore()
         if collection is None:
             return []
-
-    # ChromaDB where 필터 조건 구성 (메타데이터 기반 필터링)
-    where: dict | None = None
-    conditions = []
-    if department:
-        conditions.append({"department": {"$eq": department}})
-    if year:
-        conditions.append({"year": {"$eq": str(year)}})
-    if file_name:
-        conditions.append({"file_name": {"$eq": file_name}})
-    if page_number is not None:
-        conditions.append({"page_number": {"$eq": page_number}})
-
-    if len(conditions) == 1:
-        where = conditions[0]
-    elif len(conditions) > 1:
-        where = {"$and": conditions}
-
     try:
-        results = collection.query(
-            query_texts=[query],
-            n_results=min(k, collection.count()),
-            where=where,
-            include=["documents", "metadatas", "distances"],
-        )
+        docs = collection.query(query_text=query, n_results=k)
+        # 빈 본문/핵심 메타 누락 문서는 제외
+        filtered = []
+        for d in docs:
+            text = (d.page_content or "").strip()
+            meta = d.metadata or {}
+            if not text:
+                continue
+            if not meta.get("file_name"):
+                continue
+            filtered.append(d)
+        return filtered
     except Exception as e:
         print(f"[WARN] 검색 오류: {e}")
         return []
 
-    # ChromaDB 결과를 LangChain Document 형식으로 변환
-    docs = []
-    if results and results["documents"] and results["documents"][0]:
-        distances = results.get("distances", [[]])[0]
-        for i, (text, meta) in enumerate(zip(results["documents"][0], results["metadatas"][0])):
-            doc_meta = meta or {}
-            # 유사도 점수를 메타데이터에 추가 (cosine distance → similarity 변환)
-            if i < len(distances):
-                doc_meta["distance"] = round(distances[i], 4)
-                doc_meta["similarity"] = round(1 - distances[i], 4)
-            docs.append(Document(page_content=text, metadata=doc_meta))
 
-    return docs
-
-
-def get_indexed_file_names(
-    collection: chromadb.Collection | None = None,
-    batch_size: int = 5000,
-) -> list[str]:
-    """
-    벡터스토어에 저장된 파일명 목록을 반환
-    """
+def get_indexed_file_names(collection: Any | None = None) -> list[str]:
     if collection is None:
         collection = load_vectorstore()
         if collection is None:
             return []
-
     try:
-        total = collection.count()
+        return collection.get_indexed_file_names()
     except Exception:
         return []
 
-    file_names: set[str] = set()
-    offset = 0
 
-    while offset < total:
-        try:
-            result = collection.get(
-                include=["metadatas"],
-                limit=min(batch_size, total - offset),
-                offset=offset,
-            )
-        except Exception:
-            break
-
-        metadatas = result.get("metadatas", []) if result else []
-        for meta in metadatas:
-            if not meta:
-                continue
-            name = meta.get("file_name")
-            if name:
-                file_names.add(name)
-
-        offset += batch_size
-
-    return sorted(file_names)
-
-
-# ──────────────────────────────────────────────
-# 단독 실행 테스트 (python src/vectordb.py)
-# ──────────────────────────────────────────────
-if __name__ == "__main__":
-    from config import DATA_DIR
-    from src.pdf_processor import process_all_pdfs
-    from src.chunker import chunk_all_documents
-
-    print("=" * 50)
-    print("1단계: PDF 처리")
-    docs = process_all_pdfs(DATA_DIR)
-
-    print("\n" + "=" * 50)
-    print("2단계: 청킹")
-    chunks = chunk_all_documents(docs)
-
-    print("\n" + "=" * 50)
-    print("3단계: 벡터스토어 생성 (bge-m3 임베딩)")
-    store = create_vectorstore(chunks)
-
-    print("\n" + "=" * 50)
-    print("4단계: 검색 테스트")
-    test_query = "블록체인 관련 프로젝트"
-    results = search_documents(test_query, store)
-    print(f"\n[QUERY] '{test_query}'")
-    for i, doc in enumerate(results, 1):
-        print(f"\n결과 {i}:")
-        print(f"  파일: {doc.metadata.get('file_name', 'Unknown')[:50]}")
-        print(f"  부문: {doc.metadata.get('department', 'Unknown')}")
-        print(f"  연도: {doc.metadata.get('year', 'Unknown')}년")
-        print(f"  내용: {doc.page_content[:150]}...")
+def get_corpus_rows(collection: Any | None = None) -> list[dict[str, Any]]:
+    if collection is None:
+        collection = load_vectorstore()
+        if collection is None:
+            return []
+    try:
+        return collection.get_corpus()
+    except Exception:
+        return []

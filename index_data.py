@@ -67,17 +67,17 @@ def main() -> None:
     write_index_logs(documents, chunks)
 
     # ── Step 4: 임베딩 & 저장 ─────────────────────────
-    print(f"\n[Step 4/4] bge-m3 임베딩 생성 및 ChromaDB 저장 ({len(chunks)}개 청크)")
+    print(f"\n[Step 4/4] bge-m3 임베딩 생성 및 Vector DB 저장 ({len(chunks)}개 청크)")
     create_vectorstore(chunks)
 
     # ── 완료 ──────────────────────────────────────────
     elapsed = time.time() - start_time
     print("\n" + "=" * 60)
-    print(f"  ✅ 인덱싱 완료!")
+    print(f"  [OK] 인덱싱 완료!")
     print(f"  - 처리 문서: {len(documents)}개")
     print(f"  - 생성 청크: {len(chunks)}개")
     print(f"  - 소요 시간: {elapsed:.1f}초")
-    print(f"  - 저장 위치: {VECTORSTORE_DIR / 'chroma_db'}")
+    print(f"  - 저장 위치: Qdrant(remote)")
     print("\n  이제 'streamlit run app.py'로 챗봇을 실행하세요.")
     print("=" * 60)
 

@@ -15,7 +15,11 @@ from dotenv import load_dotenv
 # ──────────────────────────────────────────────
 # .env 파일 자동 로드 (프로젝트 루트 기준)
 # ──────────────────────────────────────────────
-load_dotenv()
+# .env 값을 현재 프로세스 환경변수보다 우선 적용해 실행 일관성 보장
+load_dotenv(override=True)
+
+# Chroma telemetry 스레드 비활성화 (Windows 환경 안정성)
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "FALSE")
 
 # ──────────────────────────────────────────────
 # 경로 설정
@@ -45,8 +49,9 @@ LLM_MODEL: str = os.getenv("LLM_MODEL", "qwen3-vl-2b-instruct")
 # 임베딩 설정 (API 또는 로컬)
 # ──────────────────────────────────────────────
 # EMBEDDING_PROVIDER:
-#   - "openai": OpenAI Embeddings API 사용 (권장)
-#   - "local" : 로컬 임베딩 모델 사용 (bge-m3 등)
+#   - "openai" : OpenAI Embeddings API 사용
+#   - "local"  : sentence-transformers 기반 로컬 임베딩 (torch 필요)
+#   - "hashing": torch 없이 동작하는 CPU 해시 임베딩
 EMBEDDING_PROVIDER: str = os.getenv("EMBEDDING_PROVIDER", "openai").lower()
 
 # OpenAI API 키 (EMBEDDING_PROVIDER=openai일 때 필요)
@@ -62,8 +67,23 @@ _DEFAULT_EMBEDDING_MODEL = (
 )
 EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", _DEFAULT_EMBEDDING_MODEL)
 
+# 원격 OpenAI 호환 임베딩 서버 설정 (EMBEDDING_PROVIDER=remote_openai)
+EMBEDDING_BASE_URL: str = os.getenv("EMBEDDING_BASE_URL", "http://192.168.5.95:8080/v1")
+EMBEDDING_API_KEY: str = os.getenv("EMBEDDING_API_KEY", "EMPTY")
+
+# hashing 임베딩 차원수 (EMBEDDING_PROVIDER=hashing 일 때 사용)
+EMBEDDING_HASH_DIM: int = int(os.getenv("EMBEDDING_HASH_DIM", "1024"))
+
 # 임베딩 벡터 배치 처리 크기 (메모리 부족 시 줄임)
 EMBEDDING_BATCH_SIZE: int = int(os.getenv("EMBEDDING_BATCH_SIZE", "32"))
+
+# 벡터 백엔드 설정: qdrant / simple
+VECTOR_BACKEND: str = os.getenv("VECTOR_BACKEND", "qdrant").lower()
+
+# Qdrant 설정
+QDRANT_URL: str = os.getenv("QDRANT_URL", "http://192.168.5.95:6333")
+QDRANT_API_KEY: str | None = os.getenv("QDRANT_API_KEY")
+QDRANT_COLLECTION: str = os.getenv("QDRANT_COLLECTION", "proposals")
 
 # ──────────────────────────────────────────────
 # OCR 설정 (이미지 기반 PDF 텍스트 추출)

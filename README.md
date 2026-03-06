@@ -1,7 +1,7 @@
 # 📄 제안서 챗봇
 
 PDF 제안서를 기반으로 질문에 답변하는 **RAG(Retrieval-Augmented Generation) 챗봇**입니다.  
-권장 스택: **OpenAI Embeddings + ChromaDB + Gemini LLM**
+권장 스택: **OpenAI Embeddings + ChromaDB + 로컬 OpenAI 호환 LLM**
 
 ---
 
@@ -10,7 +10,7 @@ PDF 제안서를 기반으로 질문에 답변하는 **RAG(Retrieval-Augmented G
 ```
 [인덱싱]  PDF → 텍스트/표/OCR 추출 → 청킹(800자) → OpenAI 임베딩 → ChromaDB 저장
 [검색]    쿼리 → OpenAI 임베딩 → ChromaDB 유사도 검색 → 상위 5개 청크
-[생성]    검색 결과 + 쿼리 → Gemini Prompt → 자연어 답변
+[생성]    검색 결과 + 쿼리 → Local LLM Prompt → 자연어 답변
 ```
 
 ## 🚀 기능
@@ -20,7 +20,7 @@ PDF 제안서를 기반으로 질문에 답변하는 **RAG(Retrieval-Augmented G
 | PDF 파싱 | 텍스트 레이어(PyMuPDF) + 표(pdfplumber) + OCR(Tesseract) 병합 |
 | 임베딩 | OpenAI Embeddings (text-embedding-3-small 등) |
 | 벡터 검색 | ChromaDB 코사인 유사도 검색 |
-| LLM 답변 | Google Gemini 기반 자연어 답변 |
+| LLM 답변 | 로컬 OpenAI 호환 LLM 기반 자연어 답변 |
 | 필터링 | 부문별(R&D/SI), 연도별 검색 필터 |
 | 채팅 UI | Streamlit 기반 채팅 인터페이스 |
 
@@ -38,7 +38,7 @@ chatbot/
     ├── pdf_processor.py  # PDF → PageContent 추출 (텍스트+표+OCR)
     ├── chunker.py        # 페이지 텍스트 → 청크 분할 (RecursiveCharacterTextSplitter)
     ├── vectordb.py       # bge-m3 임베딩 + ChromaDB 저장/검색
-    └── rag_chain.py      # RAG 파이프라인 (검색 → Gemini 답변 생성)
+    └── rag_chain.py      # RAG 파이프라인 (검색 → 로컬 LLM 답변 생성)
 ```
 
 ## ⚙️ 설치 방법
@@ -62,11 +62,11 @@ pip install -r requirements.txt
 
 ### 3. 환경변수 설정
 
-`.env.example`을 복사하여 `.env` 파일 생성 후 API 키 설정:
+`.env.example`을 복사하여 `.env` 파일 생성 후 설정:
 
 ```bash
 copy .env.example .env
-# .env 파일에서 GOOGLE_API_KEY 설정
+# .env 파일에서 LLM_BASE_URL/LLM_MODEL/OPENAI_API_KEY 설정
 ```
 
 ### 4. PDF 인덱싱 (처음 실행 시 / PDF 추가 시)
@@ -87,10 +87,11 @@ streamlit run app.py
 
 | 설정 변수 | 기본값 | 설명 |
 |-----------|--------|------|
-| `GOOGLE_API_KEY` | (필수) | Google AI Studio API 키 |
+| `LLM_BASE_URL` | `http://192.168.5.94:8001/v1` | 로컬 LLM OpenAI 호환 서버 URL |
+| `LLM_API_KEY` | `EMPTY` | 로컬 LLM API 키 (없으면 EMPTY) |
+| `LLM_MODEL` | `qwen3-vl-2b-instruct` | 로컬 LLM 모델명 |
 | `OPENAI_API_KEY` | (필수) | OpenAI API 키 (임베딩용) |
-| `DATA_DIR` | `C:\Users\User\Downloads\제안서` | PDF 폴더 경로 |
-| `GEMINI_MODEL` | `gemini-2.0-flash` | Gemini LLM 모델명 |
+| `DATA_DIR` | `C:\Users\User\Documents\chatbot\data` | PDF 폴더 경로 |
 | `EMBEDDING_PROVIDER` | `openai` | 임베딩 제공자 (`openai`/`local`) |
 | `EMBEDDING_MODEL` | `text-embedding-3-small` | 임베딩 모델명 |
 | `OCR_ENABLED` | `true` | OCR 활성화 여부 |
@@ -101,7 +102,7 @@ streamlit run app.py
 |------|-----------|-------------|
 | 임베딩 | OpenAI Embeddings | API 기반 임베딩 |
 | 벡터DB | ChromaDB | 코사인 유사도 검색 |
-| LLM | Google Gemini | Decoder-Only |
+| LLM | 로컬 OpenAI 호환 LLM | Decoder-Only |
 | PDF 파싱 | PyMuPDF + pdfplumber | - |
 | OCR | Tesseract | - |
 | UI | Streamlit | - |
