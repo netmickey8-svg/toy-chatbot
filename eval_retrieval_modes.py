@@ -5,6 +5,7 @@ import os
 from datetime import datetime, timezone
 
 from src.rag_chain import RAGChain
+from src.retrieval_pipeline import HYBRID_RETRIEVER_MODES
 
 
 QUERIES = [
@@ -30,6 +31,7 @@ def run_mode(mode: str) -> dict:
                 "results_count": ret.get("results_count"),
                 "method": ret.get("method"),
                 "cluster_enabled": ret.get("cluster_enabled"),
+                "uses_hybrid": mode in HYBRID_RETRIEVER_MODES,
                 "top_files": [d.metadata.get("file_name") for d in docs[:3]],
                 "top_pages": [d.metadata.get("page_number") for d in docs[:3]],
                 "answer_len": len(answer or ""),

@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 # 프로젝트 루트를 import 경로에 추가
@@ -34,6 +35,14 @@ from langchain_core.documents import Document
 
 from config import CHUNK_SIZE, CHUNK_OVERLAP
 from src.pdf_processor import ProcessedDocument
+
+
+@dataclass
+class SectionBlock:
+    """페이지 내부에서 감지한 섹션 단위 블록"""
+
+    title: str
+    content: str
 
 
 def _split_into_units(text: str) -> list[str]:
@@ -92,6 +101,57 @@ def _pack_units_to_chunks(units: list[str]) -> list[str]:
     return chunks
 
 
+_SECTION_PATTERNS = [
+    re.compile(r"^\s*[0-9]{1,2}[\.\)]\s*.+$"),                 # 1. 제목 / 1) 제목
+    re.compile(r"^\s*[가-힣A-Za-z]+\.\s*.+$"),                  # 가. 제목 / A. Title
+    re.compile(r"^\s*[①-⑳]\s*.+$"),                             # ① 제목
+    re.compile(r"^\s*\[[^\]]+\]\s*.+$"),                        # [섹션] 제목
+    re.compile(r"^\s*(사업|과제|기술|평가|참여|제출|일정).{0,30}$"),  # 도메인형 짧은 제목
+]
+
+
+def _is_section_heading(line: str) -> bool:
+    text = (line or "").strip()
+    if not text:
+        return False
+    # 지나치게 긴 문장은 제목으로 취급하지 않음
+    if len(text) > 80:
+        return False
+    return any(p.match(text) for p in _SECTION_PATTERNS)
+
+
+def _split_by_sections(text: str) -> list[SectionBlock]:
+    """
+    텍스트를 섹션 제목 기준으로 분할.
+    제목이 없으면 기본 섹션 1개로 반환.
+    """
+    lines = [ln.strip() for ln in text.replace("\r\n", "\n").split("\n")]
+    sections: list[SectionBlock] = []
+
+    current_title = "본문"
+    current_lines: list[str] = []
+
+    for line in lines:
+        if not line:
+            continue
+        if _is_section_heading(line):
+            if current_lines:
+                sections.append(
+                    SectionBlock(title=current_title, content="\n".join(current_lines).strip())
+                )
+            current_title = line
+            current_lines = []
+        else:
+            current_lines.append(line)
+
+    if current_lines:
+        sections.append(SectionBlock(title=current_title, content="\n".join(current_lines).strip()))
+
+    if not sections:
+        return [SectionBlock(title="본문", content=text.strip())]
+    return sections
+
+
 def _clean_text(text: str) -> str:
     """
     청킹 전 텍스트 전처리
@@ -137,30 +197,37 @@ def chunk_document(doc: ProcessedDocument) -> list[Document]:
         if not clean_content:
             continue  # 빈 페이지 스킵
 
-        # 현재 페이지를 CHUNK_SIZE 이하 단위로 분할
-        units = _split_into_units(clean_content)
-        text_chunks = _pack_units_to_chunks(units) or [clean_content[:CHUNK_SIZE]]
+        # 1차: 섹션 단위 분리
+        section_blocks = _split_by_sections(clean_content)
 
-        for chunk_text in text_chunks:
-            if not chunk_text.strip():
-                continue
+        # 2차: 각 섹션을 길이 기준으로 재청킹
+        for section_idx, block in enumerate(section_blocks, 1):
+            units = _split_into_units(block.content)
+            text_chunks = _pack_units_to_chunks(units) or [block.content[:CHUNK_SIZE]]
 
-            chunks.append(
-                Document(
-                    page_content=chunk_text,
-                    metadata={
-                        # 출처 추적: 어느 파일의 몇 페이지에서 왔는지
-                        "file_path":     doc.metadata.file_path,
-                        "file_name":     doc.metadata.file_name,
-                        # 필터링용: 부문/연도별 검색 필터에 사용
-                        "department":    doc.metadata.department,
-                        "year":          doc.metadata.year,
-                        "project_name":  doc.metadata.project_name,
-                        "page_number":   page.page_number,
-                        "total_pages":   doc.metadata.total_pages,
-                    },
+            for chunk_idx, chunk_text in enumerate(text_chunks, 1):
+                if not chunk_text.strip():
+                    continue
+
+                chunks.append(
+                    Document(
+                        page_content=chunk_text,
+                        metadata={
+                            # 출처 추적: 어느 파일의 몇 페이지에서 왔는지
+                            "file_path": doc.metadata.file_path,
+                            "file_name": doc.metadata.file_name,
+                            "department": doc.metadata.department,
+                            "year": doc.metadata.year,
+                            "project_name": doc.metadata.project_name,
+                            "page_number": page.page_number,
+                            "total_pages": doc.metadata.total_pages,
+                            # 섹션 인지형 청킹 메타데이터
+                            "section_title": block.title,
+                            "section_index": section_idx,
+                            "chunk_index": chunk_idx,
+                        },
+                    )
                 )
-            )
 
     return chunks
 

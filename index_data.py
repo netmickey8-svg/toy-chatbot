@@ -67,7 +67,7 @@ def main() -> None:
     write_index_logs(documents, chunks)
 
     # ── Step 4: 임베딩 & 저장 ─────────────────────────
-    print(f"\n[Step 4/4] bge-m3 임베딩 생성 및 Vector DB 저장 ({len(chunks)}개 청크)")
+    print(f"\n[Step 4/4] 임베딩 생성 + 사전 군집화 + Vector DB 저장 ({len(chunks)}개 청크)")
     create_vectorstore(chunks)
 
     # ── 완료 ──────────────────────────────────────────

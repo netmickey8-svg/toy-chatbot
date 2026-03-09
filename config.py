@@ -37,6 +37,9 @@ VECTORSTORE_DIR: Path = PROJECT_ROOT / "vectorstore"
 # 인덱싱 로그 저장 디렉토리
 INDEX_LOG_DIR: Path = VECTORSTORE_DIR / "index_logs"
 
+# 사전 군집화 메타데이터 저장 경로
+CLUSTER_INDEX_PATH: Path = VECTORSTORE_DIR / "cluster_index.json"
+
 # ──────────────────────────────────────────────
 # LLM API 설정 (OpenAI 호환 로컬 서버)
 # ──────────────────────────────────────────────
@@ -84,6 +87,11 @@ VECTOR_BACKEND: str = os.getenv("VECTOR_BACKEND", "qdrant").lower()
 QDRANT_URL: str = os.getenv("QDRANT_URL", "http://192.168.5.95:6333")
 QDRANT_API_KEY: str | None = os.getenv("QDRANT_API_KEY")
 QDRANT_COLLECTION: str = os.getenv("QDRANT_COLLECTION", "proposals")
+
+# 사전 군집화 설정
+CLUSTERING_ENABLED: bool = os.getenv("CLUSTERING_ENABLED", "true").lower() == "true"
+CLUSTER_N_CLUSTERS: int = int(os.getenv("CLUSTER_N_CLUSTERS", "12"))
+CLUSTER_TOP_N: int = int(os.getenv("CLUSTER_TOP_N", "2"))
 
 # ──────────────────────────────────────────────
 # OCR 설정 (이미지 기반 PDF 텍스트 추출)

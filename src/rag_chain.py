@@ -39,11 +39,9 @@ from openai import OpenAI
 from config import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, EMBEDDING_MODEL
 from src.vectordb import (
     load_vectorstore,
-    search_documents,
-    get_corpus_rows,
-    get_embedding_function,
 )
-from src.hybrid_retriever import HybridRetriever, HybridConfig
+from src.query_intent import is_index_inventory_question, normalize_retrieval_query
+from src.retrieval_pipeline import HYBRID_RETRIEVER_MODES, RetrievalPipeline
 
 # ──────────────────────────────────────────────
 # 시스템 프롬프트 템플릿
@@ -127,31 +125,14 @@ class RAGChain:
         self.llm_model = LLM_MODEL
         self.retriever_mode = os.getenv("RETRIEVER_MODE", "hybrid").lower()
         self.retrieval_trace_path = Path("vectorstore") / "retrieval_trace.jsonl"
-        self.hybrid = None
-        self._build_hybrid_retriever()
-
-    def _build_hybrid_retriever(self) -> None:
-        self.hybrid = None
-        if self.retriever_mode not in {"hybrid", "hybrid_cluster"}:
-            return
-        if self.vectorstore is None:
-            return
-        cfg = HybridConfig(
-            dense_weight=float(os.getenv("DENSE_WEIGHT", "0.7")),
-            sparse_weight=float(os.getenv("SPARSE_WEIGHT", "0.3")),
-            use_clustering=self.retriever_mode == "hybrid_cluster",
-            n_clusters=int(os.getenv("CLUSTER_N_CLUSTERS", "6")),
-            cluster_top_n=int(os.getenv("CLUSTER_TOP_N", "2")),
-        )
-        rows = get_corpus_rows(self.vectorstore)
-        self.hybrid = HybridRetriever(rows, get_embedding_function(), cfg)
+        self.retrieval = RetrievalPipeline(self.vectorstore, self.retriever_mode)
 
     def refresh_retriever(self) -> None:
         """
         벡터스토어 변경(웹 업로드 인덱싱) 직후 retriever 캐시를 갱신
         """
         self.vectorstore = load_vectorstore()
-        self._build_hybrid_retriever()
+        self.retrieval.refresh(self.vectorstore)
 
     def _write_retrieval_trace(self, query: str, retrieval_info: dict) -> None:
         try:
@@ -166,31 +147,6 @@ class RAGChain:
                 f.write(json.dumps(payload, ensure_ascii=False) + "\n")
         except Exception:
             pass
-
-    @staticmethod
-    def _normalize_retrieval_query(question: str) -> str:
-        """
-        표현이 다른 동의 질의를 retrieval 친화 키워드로 확장
-        - 생성용 질문(question)은 원문 유지
-        - 검색용 질의만 확장하여 일관된 섹션을 찾도록 유도
-        """
-        q = question.strip()
-        lowered = q.lower()
-
-        people_patterns = [
-            "참여하는 사람",
-            "누가 참여",
-            "참여자",
-            "참여 인원",
-            "참여 인력",
-            "참여인력",
-            "투입 인력",
-            "투입인력",
-        ]
-        if any(p in q for p in people_patterns) or "participant" in lowered:
-            return q + " 참여인력 투입인력 연구원 인력구성 참여율"
-
-        return q
 
     def _resolve_available_model(self) -> str | None:
         """LLM 서버에서 사용 가능한 모델명을 조회"""
@@ -300,21 +256,35 @@ class RAGChain:
             "page_filter": page_number,
         }
 
-        # ── Step 2: 트랜스포머 임베딩 기반 문서 검색 ──────
-        retrieval_query = self._normalize_retrieval_query(question)
-        retrieval_info = {}
-        if self.retriever_mode in {"hybrid", "hybrid_cluster"} and self.hybrid is not None:
-            docs, retrieval_info = self.hybrid.retrieve(retrieval_query, k=5)
-        else:
-            docs = search_documents(query=retrieval_query, collection=self.vectorstore)
-            retrieval_info = {
-                "total_candidates": None,
-                "cluster_enabled": False,
-                "clusters": 0,
-                "dense_weight": 1.0,
-                "sparse_weight": 0.0,
-                "top_docs": [],
+        # 인덱싱된 문서 목록/개수 질문은 LLM 대신 메타데이터로 직접 응답
+        if is_index_inventory_question(question):
+            names = self.retrieval.list_indexed_files()
+            if not names:
+                answer = "현재 인덱싱된 제안서가 없습니다."
+            else:
+                lines = [f"- {n}" for n in names[:20]]
+                answer = (
+                    f"현재 인덱싱된 제안서는 총 {len(names)}개입니다.\n\n"
+                    f"파일 목록:\n" + "\n".join(lines)
+                )
+                if len(names) > 20:
+                    answer += f"\n... 외 {len(names) - 20}개"
+            pipeline_info["retrieval"] = {
+                "method": "Inventory Lookup",
+                "retriever_mode": self.retriever_mode,
+                "results_count": len(names),
+                "chunks": [],
             }
+            pipeline_info["generation"] = {
+                "model": "metadata",
+                "status": "성공(메타데이터 직접 응답)",
+                "answer_length": len(answer),
+            }
+            return answer, [], pipeline_info
+
+        # ── Step 2: 트랜스포머 임베딩 기반 문서 검색 ──────
+        retrieval_query = normalize_retrieval_query(question)
+        docs, retrieval_info = self.retrieval.retrieve(retrieval_query, k=5)
 
         retrieval_info["retrieval_query"] = retrieval_query
         self._write_retrieval_trace(question, retrieval_info)
@@ -323,7 +293,7 @@ class RAGChain:
             "model": self.embedding_model,
             "method": (
                 "Hybrid Retrieval (Dense+Sparse)"
-                if self.retriever_mode in {"hybrid", "hybrid_cluster"}
+                if self.retriever_mode in HYBRID_RETRIEVER_MODES
                 else "Dense Retrieval (코사인 유사도)"
             ),
             "retriever_mode": self.retriever_mode,

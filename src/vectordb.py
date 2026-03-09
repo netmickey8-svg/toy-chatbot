@@ -11,6 +11,7 @@ import hashlib
 import json
 from pathlib import Path
 from typing import Any
+from collections import defaultdict
 
 import numpy as np
 from langchain_core.documents import Document
@@ -18,6 +19,7 @@ from openai import OpenAI
 from qdrant_client import QdrantClient, models
 
 from config import (
+    CLUSTERING_ENABLED,
     VECTORSTORE_DIR,
     VECTOR_BACKEND,
     QDRANT_URL,
@@ -32,6 +34,7 @@ from config import (
     EMBEDDING_BATCH_SIZE,
     TOP_K_RESULTS,
 )
+from src.cluster_index import build_cluster_index_from_rows, clear_cluster_index, save_cluster_index
 
 
 SIMPLE_STORE_FILE = VECTORSTORE_DIR / "simple_store.json"
@@ -50,9 +53,37 @@ def _meta_match(meta: dict, where: dict | None) -> bool:
         if isinstance(cond, dict) and "$eq" in cond:
             if str(meta.get(key)) != str(cond["$eq"]):
                 return False
+        elif isinstance(cond, dict) and "$in" in cond:
+            values = {str(value) for value in cond["$in"]}
+            if str(meta.get(key)) not in values:
+                return False
         elif meta.get(key) != cond:
             return False
     return True
+
+
+def _build_qdrant_filter(where: dict | None) -> models.Filter | None:
+    if not where:
+        return None
+    must: list[models.FieldCondition] = []
+    for key, cond in where.items():
+        if isinstance(cond, dict) and "$eq" in cond:
+            must.append(
+                models.FieldCondition(
+                    key=key,
+                    match=models.MatchValue(value=cond["$eq"]),
+                )
+            )
+        elif isinstance(cond, dict) and "$in" in cond:
+            must.append(
+                models.FieldCondition(
+                    key=key,
+                    match=models.MatchAny(any=cond["$in"]),
+                )
+            )
+    if not must:
+        return None
+    return models.Filter(must=must)
 
 
 class SimpleCollection:
@@ -83,9 +114,11 @@ class SimpleCollection:
     def count(self) -> int:
         return len(self._rows)
 
-    def get_corpus(self) -> list[dict[str, Any]]:
+    def get_corpus(self, where: dict | None = None) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         for r in self._rows:
+            if not _meta_match(r.get("metadata", {}), where):
+                continue
             rows.append(
                 {
                     "id": r.get("id"),
@@ -134,6 +167,20 @@ class SimpleCollection:
             meta["similarity"] = round(float(sim[i]), 4)
             docs.append(Document(page_content=row.get("document", ""), metadata=meta))
         return docs
+
+    def set_cluster_ids(self, assignments: dict[str, int]) -> None:
+        if not assignments:
+            return
+        changed = False
+        for row in self._rows:
+            row_id = str(row.get("id"))
+            if row_id not in assignments:
+                continue
+            row.setdefault("metadata", {})
+            row["metadata"]["cluster_id"] = int(assignments[row_id])
+            changed = True
+        if changed:
+            self._save()
 
     def get_indexed_file_names(self) -> list[str]:
         names = {r.get("metadata", {}).get("file_name") for r in self._rows}
@@ -187,20 +234,12 @@ class QdrantCollection:
     def delete(self, where: dict | None = None) -> None:
         if not where:
             return
-        must: list[models.FieldCondition] = []
-        for key, cond in where.items():
-            if isinstance(cond, dict) and "$eq" in cond:
-                must.append(
-                    models.FieldCondition(
-                        key=key,
-                        match=models.MatchValue(value=cond["$eq"]),
-                    )
-                )
-        if not must:
+        qfilter = _build_qdrant_filter(where)
+        if qfilter is None:
             return
         self.client.delete(
             collection_name=self.name,
-            points_selector=models.FilterSelector(filter=models.Filter(must=must)),
+            points_selector=models.FilterSelector(filter=qfilter),
             wait=True,
         )
 
@@ -221,6 +260,21 @@ class QdrantCollection:
             payload["distance"] = round(1 - score, 4)
             docs.append(Document(page_content=text, metadata=payload))
         return docs
+
+    def set_cluster_ids(self, assignments: dict[str, int]) -> None:
+        if not assignments:
+            return
+        grouped: dict[int, list[str]] = defaultdict(list)
+        for point_id, cluster_id in assignments.items():
+            grouped[int(cluster_id)].append(str(point_id))
+
+        for cluster_id, point_ids in grouped.items():
+            self.client.set_payload(
+                collection_name=self.name,
+                payload={"cluster_id": int(cluster_id)},
+                points=point_ids,
+                wait=True,
+            )
 
     def get_indexed_file_names(self) -> list[str]:
         names: set[str] = set()
@@ -249,15 +303,17 @@ class QdrantCollection:
         except Exception:
             return 0
 
-    def get_corpus(self) -> list[dict[str, Any]]:
+    def get_corpus(self, where: dict | None = None) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         offset = None
+        qfilter = _build_qdrant_filter(where)
         while True:
             points, offset = self.client.scroll(
                 collection_name=self.name,
                 limit=256,
                 with_payload=True,
                 with_vectors=True,
+                scroll_filter=qfilter,
                 offset=offset,
             )
             if not points:
@@ -372,7 +428,12 @@ def create_vectorstore(chunks: list[Document]):
         # 기존 컬렉션의 잔존/테스트 포인트까지 포함해 완전 초기화
         sample_vec = embedding_fn([chunks[0].page_content])[0]
         collection.reset(vector_size=len(sample_vec))
-    return upsert_vectorstore(chunks, collection=collection)
+    collection = upsert_vectorstore(chunks, collection=collection)
+    if CLUSTERING_ENABLED:
+        recluster_collection(collection)
+    else:
+        clear_cluster_index()
+    return collection
 
 
 def upsert_vectorstore(
@@ -465,12 +526,35 @@ def get_indexed_file_names(collection: Any | None = None) -> list[str]:
         return []
 
 
-def get_corpus_rows(collection: Any | None = None) -> list[dict[str, Any]]:
+def get_corpus_rows(
+    collection: Any | None = None,
+    where: dict | None = None,
+) -> list[dict[str, Any]]:
     if collection is None:
         collection = load_vectorstore()
         if collection is None:
             return []
     try:
-        return collection.get_corpus()
+        return collection.get_corpus(where=where)
     except Exception:
         return []
+
+
+def recluster_collection(collection: Any | None = None) -> dict[str, Any] | None:
+    if not CLUSTERING_ENABLED:
+        clear_cluster_index()
+        return None
+    if collection is None:
+        collection = load_vectorstore()
+        if collection is None:
+            return None
+
+    rows = get_corpus_rows(collection=collection)
+    assignments, cluster_meta = build_cluster_index_from_rows(rows)
+    if not assignments or cluster_meta is None:
+        clear_cluster_index()
+        return None
+
+    collection.set_cluster_ids(assignments)
+    save_cluster_index(cluster_meta)
+    return cluster_meta

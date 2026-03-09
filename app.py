@@ -1,20 +1,32 @@
 """
 제안서 챗봇 - Streamlit UI
 """
+import altair as alt
+import numpy as np
+import pandas as pd
 import streamlit as st
 from pathlib import Path
 import re
 import logging
 import traceback
 import faulthandler
+from sklearn.decomposition import PCA
 
 import sys
 sys.path.insert(0, str(Path(__file__).parent))
 
+from src.cluster_index import load_cluster_index
 from src.rag_chain import RAGChain
-from src.vectordb import upsert_vectorstore, get_indexed_file_names
-from src.pdf_processor import process_pdf
-from src.chunker import chunk_document
+from src.retrieval_pipeline import HYBRID_RETRIEVER_MODES
+from src.vectordb import (
+    create_vectorstore,
+    get_corpus_rows,
+    get_indexed_file_names,
+    recluster_collection,
+    upsert_vectorstore,
+)
+from src.pdf_processor import process_all_pdfs, process_pdf
+from src.chunker import chunk_all_documents, chunk_document
 from src.index_logs import load_index_log, write_index_logs
 from config import DATA_DIR
 
@@ -159,6 +171,61 @@ def save_uploaded_pdf(uploaded_file, department: str) -> Path:
     return target_path
 
 
+def list_data_pdf_entries(indexed_names: set[str]) -> list[dict]:
+    """data 디렉토리 내 PDF 파일과 인덱싱 여부를 함께 반환"""
+    if not DATA_DIR.exists():
+        return []
+
+    entries = []
+    for path in sorted(DATA_DIR.rglob("*.pdf")):
+        entries.append(
+            {
+                "label": str(path.relative_to(DATA_DIR)),
+                "path": path,
+                "file_name": path.name,
+                "department": path.parent.name,
+                "indexed": path.name in indexed_names,
+            }
+        )
+    return entries
+
+
+def build_preview_from_chunks(chunks: list, limit: int = 10) -> list[dict]:
+    """최근 인덱싱된 청크 미리보기 생성"""
+    preview = []
+    for chunk in chunks[:limit]:
+        meta = chunk.metadata or {}
+        preview.append(
+            {
+                "page_number": meta.get("page_number", "-"),
+                "length": len(chunk.page_content),
+                "text": (
+                    chunk.page_content[:300] + "..."
+                    if len(chunk.page_content) > 300
+                    else chunk.page_content
+                ),
+            }
+        )
+    return preview
+
+
+def process_selected_paths(paths: list[Path]) -> tuple[list, list]:
+    """선택한 PDF 파일들만 처리하여 문서/청크를 생성"""
+    docs = []
+    chunks = []
+    for path in paths:
+        department = path.parent.name
+        doc = process_pdf(path, department)
+        if not doc:
+            continue
+        doc_chunks = chunk_document(doc)
+        if not doc_chunks:
+            continue
+        docs.append(doc)
+        chunks.extend(doc_chunks)
+    return docs, chunks
+
+
 def display_pipeline_info(pipeline_info: dict):
     """RAG 파이프라인 단계별 정보를 expander로 표시"""
     if not pipeline_info:
@@ -181,7 +248,7 @@ def display_pipeline_info(pipeline_info: dict):
             col1.metric("임베딩 모델", ret.get("model", ""))
             col2.metric("검색된 청크", f"{ret.get('results_count', 0)}개")
             col3.metric("검색 모드", ret.get("retriever_mode", "dense"))
-            if ret.get("retriever_mode") in {"hybrid", "hybrid_cluster"}:
+            if ret.get("retriever_mode") in HYBRID_RETRIEVER_MODES:
                 st.caption(
                     f"dense={ret.get('dense_weight')} / sparse={ret.get('sparse_weight')} | "
                     f"cluster={ret.get('cluster_enabled')} ({ret.get('clusters')}개)"
@@ -238,6 +305,163 @@ def display_pipeline_info(pipeline_info: dict):
                 st.warning(f"상태: {status}")
 
 
+def render_sources(docs: list) -> None:
+    """참조 문서 카드 렌더링"""
+    with st.expander("📚 참조된 제안서"):
+        for doc in docs:
+            meta = doc.metadata
+            st.markdown(f"""
+            <div class="source-card">
+                <strong>📄 {meta.get('file_name', 'Unknown')[:50]}...</strong><br>
+                📁 {meta.get('department', '')} | 📅 {meta.get('year', '')}년 | 📄 {meta.get('page_number', '')}p
+            </div>
+            """, unsafe_allow_html=True)
+
+
+def _sample_corpus_rows(rows: list[dict], max_points: int) -> list[dict]:
+    """차트 렌더링 부하를 줄이기 위한 결정적 샘플링"""
+    if len(rows) <= max_points:
+        return rows
+    idx = np.linspace(0, len(rows) - 1, num=max_points, dtype=int)
+    return [rows[i] for i in idx]
+
+
+def _build_cluster_dataframe(rows: list[dict], max_points: int) -> tuple[pd.DataFrame, dict]:
+    """벡터+메타데이터를 PCA 2D 시각화용 데이터프레임으로 변환"""
+    valid_rows = []
+    for row in rows:
+        vector = row.get("vector")
+        meta = dict(row.get("metadata") or {})
+        text = (row.get("document") or "").strip()
+        if vector is None or meta.get("cluster_id") is None or not text:
+            continue
+        valid_rows.append(
+            {
+                "vector": vector,
+                "cluster_id": int(meta.get("cluster_id")),
+                "file_name": meta.get("file_name", "Unknown"),
+                "page_number": meta.get("page_number", -1),
+                "department": meta.get("department", ""),
+                "year": meta.get("year", ""),
+                "section_title": meta.get("section_title", ""),
+                "preview": text[:120] + "..." if len(text) > 120 else text,
+            }
+        )
+
+    sampled_rows = _sample_corpus_rows(valid_rows, max_points=max_points)
+    if not sampled_rows:
+        return pd.DataFrame(), {"total_points": 0, "plotted_points": 0, "clusters": 0}
+
+    matrix = np.asarray([row["vector"] for row in sampled_rows], dtype=np.float32)
+    if len(sampled_rows) == 1:
+        coords = np.array([[0.0, 0.0]], dtype=np.float32)
+    else:
+        reducer = PCA(n_components=2, random_state=42)
+        coords = reducer.fit_transform(matrix)
+
+    records = []
+    for idx, row in enumerate(sampled_rows):
+        records.append(
+            {
+                "x": float(coords[idx][0]),
+                "y": float(coords[idx][1]),
+                "cluster_id": str(row["cluster_id"]),
+                "file_name": row["file_name"],
+                "page_number": row["page_number"],
+                "department": row["department"],
+                "year": row["year"],
+                "section_title": row["section_title"],
+                "preview": row["preview"],
+            }
+        )
+
+    df = pd.DataFrame.from_records(records)
+    stats = {
+        "total_points": len(valid_rows),
+        "plotted_points": len(sampled_rows),
+        "clusters": df["cluster_id"].nunique(),
+    }
+    return df, stats
+
+
+def render_cluster_map(rag) -> None:
+    """사전 군집화 결과를 2D PCA 산점도로 시각화"""
+    with st.expander("🗺️ 클러스터 맵", expanded=False):
+        cluster_meta = load_cluster_index()
+        if not cluster_meta:
+            st.info("사전 군집화 메타데이터가 없습니다. `python index_data.py`로 재인덱싱한 뒤 확인하세요.")
+            return
+
+        rows = get_corpus_rows(rag.vectorstore)
+        if not rows:
+            st.info("시각화할 벡터 데이터가 없습니다.")
+            return
+
+        col1, col2 = st.columns([1, 1])
+        max_points = col1.selectbox(
+            "표시할 최대 청크 수",
+            options=[300, 500, 1000, 2000],
+            index=2,
+        )
+
+        df, stats = _build_cluster_dataframe(rows, max_points=max_points)
+        if df.empty:
+            st.info("클러스터가 할당된 청크가 없어 맵을 그릴 수 없습니다.")
+            return
+
+        cluster_options = sorted(df["cluster_id"].unique(), key=lambda x: int(x))
+        selected_clusters = col2.multiselect(
+            "표시할 클러스터",
+            options=cluster_options,
+            default=[],
+            placeholder="전체 클러스터",
+        )
+        if selected_clusters:
+            df = df[df["cluster_id"].isin(selected_clusters)]
+
+        meta_cols = st.columns(4)
+        meta_cols[0].metric("총 청크", f"{stats['total_points']:,}")
+        meta_cols[1].metric("차트 표시", f"{len(df):,}")
+        meta_cols[2].metric("클러스터 수", cluster_meta.get("n_clusters", stats["clusters"]))
+        meta_cols[3].metric("임베딩 모델", cluster_meta.get("embedding_model", "-"))
+
+        chart = (
+            alt.Chart(df)
+            .mark_circle(size=70, opacity=0.8)
+            .encode(
+                x=alt.X("x:Q", title="PCA-1"),
+                y=alt.Y("y:Q", title="PCA-2"),
+                color=alt.Color("cluster_id:N", title="Cluster"),
+                tooltip=[
+                    alt.Tooltip("cluster_id:N", title="Cluster"),
+                    alt.Tooltip("file_name:N", title="파일"),
+                    alt.Tooltip("page_number:Q", title="페이지"),
+                    alt.Tooltip("department:N", title="부문"),
+                    alt.Tooltip("year:N", title="연도"),
+                    alt.Tooltip("section_title:N", title="섹션"),
+                    alt.Tooltip("preview:N", title="미리보기"),
+                ],
+            )
+            .interactive()
+            .properties(height=520)
+        )
+        st.altair_chart(chart, use_container_width=True)
+
+        summary = (
+            df.groupby("cluster_id", as_index=False)
+            .agg(
+                chunks=("cluster_id", "size"),
+                files=("file_name", "nunique"),
+            )
+            .sort_values(["chunks", "cluster_id"], ascending=[False, True])
+        )
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+        st.caption(
+            f"cluster_index 생성 시각: {cluster_meta.get('created_at', '-')} | "
+            f"샘플링 전 청크 수: {stats['total_points']:,}"
+        )
+
+
 def display_chat_history():
     """채팅 기록 표시"""
     for message in st.session_state.messages:
@@ -250,15 +474,7 @@ def display_chat_history():
 
             # 참조 문서 표시
             if "sources" in message and message["sources"]:
-                with st.expander("📚 참조된 제안서"):
-                    for doc in message["sources"]:
-                        meta = doc.metadata
-                        st.markdown(f"""
-                        <div class="source-card">
-                            <strong>📄 {meta.get('file_name', 'Unknown')[:50]}...</strong><br>
-                            📁 {meta.get('department', '')} | 📅 {meta.get('year', '')}년 | 📄 {meta.get('page_number', '')}p
-                        </div>
-                        """, unsafe_allow_html=True)
+                render_sources(message["sources"])
 
 
 def main():
@@ -273,6 +489,9 @@ def main():
     # RAG 체인 로드
     rag = load_rag_chain()
     logging.info("rag loaded; ready=%s", getattr(rag, "is_ready", lambda: False)())
+    indexed_names = set(get_indexed_file_names(getattr(rag, "vectorstore", None)))
+    pdf_entries = list_data_pdf_entries(indexed_names)
+    entry_by_label = {entry["label"]: entry for entry in pdf_entries}
 
     # 사이드바
     with st.sidebar:
@@ -280,66 +499,91 @@ def main():
         uploaded_files = st.file_uploader("PDF 파일 업로드", type=["pdf"], accept_multiple_files=True)
         if uploaded_files:
             st.caption(f"선택된 파일: {len(uploaded_files)}개")
-            if st.button("선택 파일 인덱싱"):
+            if st.button("선택 파일 저장"):
                 try:
-                    all_docs = []
-                    all_chunks = []
-                    overwrite_files = []
-                    preview = []
-
                     for uploaded_file in uploaded_files:
                         auto_department = infer_department(uploaded_file.name)
-                        saved_path = save_uploaded_pdf(uploaded_file, auto_department)
-                        doc = process_pdf(saved_path, auto_department)
-                        if not doc:
-                            continue
-                        chunks = chunk_document(doc)
-                        if not chunks:
-                            continue
-                        all_docs.append(doc)
-                        all_chunks.extend(chunks)
-                        overwrite_files.append(doc.metadata.file_name)
-                        for chunk in chunks[:3]:
-                            meta = chunk.metadata or {}
-                            preview.append(
-                                {
-                                    "page_number": meta.get("page_number", "-"),
-                                    "length": len(chunk.page_content),
-                                    "text": (
-                                        chunk.page_content[:300] + "..."
-                                        if len(chunk.page_content) > 300
-                                        else chunk.page_content
-                                    ),
-                                }
-                            )
+                        save_uploaded_pdf(uploaded_file, auto_department)
+                    st.success("파일 저장 완료. 아래 인덱싱 관리에서 전체 인덱싱 또는 재인덱싱을 실행하세요.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"업로드 오류: {e}")
 
+        st.markdown("---")
+        st.header("🛠️ 인덱싱 관리")
+        st.caption(f"data 폴더 PDF: {len(pdf_entries)}개 | 인덱싱된 파일: {len(indexed_names)}개")
+
+        if st.button("전체 인덱싱 실행", disabled=not pdf_entries):
+            try:
+                with st.spinner("전체 PDF를 인덱싱하는 중..."):
+                    all_docs = process_all_pdfs(DATA_DIR)
+                    all_chunks = chunk_all_documents(all_docs)
                     if not all_chunks:
                         st.error("인덱싱 가능한 텍스트를 찾지 못했습니다.")
                     else:
-                        rag.vectorstore = upsert_vectorstore(
-                            all_chunks,
-                            rag.vectorstore,
-                            overwrite_files=overwrite_files,
-                        )
+                        rag.vectorstore = create_vectorstore(all_chunks)
                         write_index_logs(all_docs, all_chunks)
                         rag.refresh_retriever()
-                        st.session_state.last_chunk_preview = preview[:10]
-                        st.success(f"인덱싱 완료: 파일 {len(all_docs)}개, 청크 {len(all_chunks)}개")
+                        st.session_state.last_chunk_preview = build_preview_from_chunks(all_chunks)
+                        st.success(f"전체 인덱싱 완료: 파일 {len(all_docs)}개, 청크 {len(all_chunks)}개")
                         st.rerun()
-                except Exception as e:
-                    st.error(f"업로드/인덱싱 오류: {e}")
+            except Exception as e:
+                st.error(f"전체 인덱싱 오류: {e}")
+
+        indexed_labels = [entry["label"] for entry in pdf_entries if entry["indexed"]]
+        selected_labels = st.multiselect(
+            "재인덱싱할 파일 선택",
+            options=indexed_labels,
+            placeholder="이미 인덱싱된 파일만 표시됩니다.",
+        )
+        if st.button("선택 파일 재인덱싱", disabled=not selected_labels):
+            try:
+                selected_paths = [entry_by_label[label]["path"] for label in selected_labels]
+                with st.spinner("선택 파일을 재인덱싱하는 중..."):
+                    selected_docs, selected_chunks = process_selected_paths(selected_paths)
+                    if not selected_chunks:
+                        st.error("선택한 파일에서 인덱싱 가능한 텍스트를 찾지 못했습니다.")
+                    else:
+                        overwrite_files = [doc.metadata.file_name for doc in selected_docs]
+                        rag.vectorstore = upsert_vectorstore(
+                            selected_chunks,
+                            collection=getattr(rag, "vectorstore", None),
+                            overwrite_files=overwrite_files,
+                        )
+                        write_index_logs(selected_docs, selected_chunks)
+                        recluster_collection(rag.vectorstore)
+                        rag.refresh_retriever()
+                        st.session_state.last_chunk_preview = build_preview_from_chunks(selected_chunks)
+                        st.success(
+                            f"재인덱싱 완료: 파일 {len(selected_docs)}개, 청크 {len(selected_chunks)}개"
+                        )
+                        st.rerun()
+            except Exception as e:
+                st.error(f"선택 파일 재인덱싱 오류: {e}")
 
         st.markdown("---")
         st.header("📚 인덱싱된 파일")
-        try:
-            names = get_indexed_file_names(rag.vectorstore)
-            st.caption(f"총 {len(names)}개")
-            if names:
-                with st.expander("파일 목록 보기", expanded=False):
-                    for n in names:
-                        st.write(f"- {n}")
-        except Exception as e:
-            st.caption(f"파일 목록 조회 실패: {e}")
+        st.caption(f"총 {len(indexed_names)}개")
+        if indexed_names:
+            with st.expander("파일 목록 보기", expanded=False):
+                for n in sorted(indexed_names):
+                    st.write(f"- {n}")
+
+        st.markdown("---")
+        st.header("🗂️ data 폴더 파일")
+        if pdf_entries:
+            with st.expander("PDF 목록 보기", expanded=False):
+                file_df = pd.DataFrame(
+                    [
+                        {
+                            "경로": entry["label"],
+                            "부문": entry["department"],
+                            "인덱싱됨": "Y" if entry["indexed"] else "N",
+                        }
+                        for entry in pdf_entries
+                    ]
+                )
+                st.dataframe(file_df, use_container_width=True, hide_index=True)
 
         st.markdown("---")
         st.markdown("""
@@ -357,13 +601,11 @@ def main():
 
     # 벡터스토어 확인
     if not rag.is_ready():
-        st.error("""
-        ⚠️ **벡터스토어가 없습니다!**
+        st.info("""
+        현재 인덱스가 없습니다.
 
-        먼저 다음 명령어로 PDF를 인덱싱하세요:
-        ```bash
-        python index_data.py
-        ```
+        서버는 그대로 사용할 수 있고, 사이드바 `인덱싱 관리`에서 `전체 인덱싱 실행` 또는
+        업로드 후 수동 인덱싱을 실행하면 채팅이 활성화됩니다.
         """)
         return
 
@@ -376,6 +618,8 @@ def main():
                 )
                 st.text(item["text"])
                 st.markdown("---")
+
+    render_cluster_map(rag)
 
     # 채팅 기록 표시
     display_chat_history()
@@ -405,15 +649,7 @@ def main():
 
             # 참조 문서 표시
             if docs:
-                with st.expander("📚 참조된 제안서"):
-                    for doc in docs:
-                        meta = doc.metadata
-                        st.markdown(f"""
-                        <div class="source-card">
-                            <strong>📄 {meta.get('file_name', 'Unknown')[:50]}...</strong><br>
-                            📁 {meta.get('department', '')} | 📅 {meta.get('year', '')}년 | 📄 {meta.get('page_number', '')}p
-                        </div>
-                        """, unsafe_allow_html=True)
+                render_sources(docs)
 
             # 인덱싱 로그 표시
             if docs:
