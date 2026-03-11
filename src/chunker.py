@@ -34,7 +34,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from langchain_core.documents import Document
 
 from config import CHUNK_SIZE, CHUNK_OVERLAP
-from src.pdf_processor import ProcessedDocument
+from src.chunk_labels import infer_chunk_label
+from src.pdf_processor import ContentBlock, ProcessedDocument
 
 
 @dataclass
@@ -43,6 +44,7 @@ class SectionBlock:
 
     title: str
     content: str
+    content_type: str = "text"
 
 
 def _split_into_units(text: str) -> list[str]:
@@ -152,6 +154,47 @@ def _split_by_sections(text: str) -> list[SectionBlock]:
     return sections
 
 
+def _build_blocks_for_chunking(page_content: str, blocks: list[ContentBlock]) -> list[SectionBlock]:
+    """
+    페이지 내부 블록을 청킹용 섹션 블록으로 변환한다.
+
+    - text/ocr: 제목 감지 기반 섹션 분리
+    - table: 표 자체를 하나의 섹션으로 유지
+    """
+    if not blocks:
+        return _split_by_sections(page_content)
+
+    section_blocks: list[SectionBlock] = []
+    for block in blocks:
+        clean_block = _clean_text(block.content)
+        if not clean_block:
+            continue
+
+        if block.content_type == "table":
+            section_blocks.append(
+                SectionBlock(
+                    title="TABLE",
+                    content=clean_block,
+                    content_type="table",
+                )
+            )
+            continue
+
+        if block.content_type == "ocr":
+            ocr_sections = _split_by_sections(clean_block)
+            for section in ocr_sections:
+                section.content_type = "ocr"
+            section_blocks.extend(ocr_sections)
+            continue
+
+        text_sections = _split_by_sections(clean_block)
+        for section in text_sections:
+            section.content_type = "text"
+        section_blocks.extend(text_sections)
+
+    return section_blocks
+
+
 def _clean_text(text: str) -> str:
     """
     청킹 전 텍스트 전처리
@@ -197,17 +240,23 @@ def chunk_document(doc: ProcessedDocument) -> list[Document]:
         if not clean_content:
             continue  # 빈 페이지 스킵
 
-        # 1차: 섹션 단위 분리
-        section_blocks = _split_by_sections(clean_content)
+        # 1차: 블록/섹션 단위 분리
+        section_blocks = _build_blocks_for_chunking(clean_content, getattr(page, "blocks", []))
 
         # 2차: 각 섹션을 길이 기준으로 재청킹
         for section_idx, block in enumerate(section_blocks, 1):
-            units = _split_into_units(block.content)
+            units = (
+                [line.strip() for line in block.content.splitlines() if line.strip()]
+                if block.content_type == "table"
+                else _split_into_units(block.content)
+            )
             text_chunks = _pack_units_to_chunks(units) or [block.content[:CHUNK_SIZE]]
 
             for chunk_idx, chunk_text in enumerate(text_chunks, 1):
                 if not chunk_text.strip():
                     continue
+
+                chunk_label = infer_chunk_label(block.title, chunk_text)
 
                 chunks.append(
                     Document(
@@ -225,6 +274,8 @@ def chunk_document(doc: ProcessedDocument) -> list[Document]:
                             "section_title": block.title,
                             "section_index": section_idx,
                             "chunk_index": chunk_idx,
+                            "content_type": block.content_type,
+                            "chunk_label": chunk_label,
                         },
                     )
                 )

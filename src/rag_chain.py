@@ -40,7 +40,12 @@ from config import LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, EMBEDDING_MODEL
 from src.vectordb import (
     load_vectorstore,
 )
-from src.query_intent import is_index_inventory_question, normalize_retrieval_query
+from src.query_intent import (
+    is_index_inventory_question,
+    is_people_question,
+    is_people_overlap_question,
+    normalize_retrieval_query,
+)
 from src.retrieval_pipeline import HYBRID_RETRIEVER_MODES, RetrievalPipeline
 
 # ──────────────────────────────────────────────
@@ -56,6 +61,53 @@ SYSTEM_PROMPT = """당신은 제안서 전문가입니다.
 2. 관련 제안서의 이름, 연도, 부문(R&D/SI)을 명시하세요.
 3. 검색 결과가 없거나 관련 없으면 솔직히 알려주세요.
 4. 답변은 친절하고 이해하기 쉽게 작성하세요.
+
+## 검색된 제안서 정보:
+{context}
+
+## 사용자 질문:
+{question}"""
+
+PEOPLE_QUERY_PROMPT = """당신은 제안서 참여인력 정리 도우미입니다.
+사용자의 질문은 제안서별 참여인력이나 이름 목록을 묻는 질문입니다.
+
+## 매우 중요한 규칙
+1. 사람 이름으로 명시된 표현만 이름으로 적으세요.
+2. 문장 전체, 설명 문구, 절차 문구, 긴 표 행 전체를 사람 이름으로 쓰면 안 됩니다.
+3. 이름이 불명확하면 억지로 추정하지 말고 "이름 명시 없음" 또는 "확인 불가"라고 답하세요.
+4. 같은 파일명 아래의 여러 청크/페이지는 모두 동일한 하나의 제안서입니다.
+5. 파일별로 구분해서 정리하고, 파일명과 페이지를 근거로 제시하세요.
+
+## 출력 형식
+- 파일명
+  - 페이지
+  - 참여인력: 이름1, 이름2 ...
+  - 비고: 이름이 명확하지 않으면 그 사유
+
+## 검색된 제안서 정보:
+{context}
+
+## 사용자 질문:
+{question}"""
+
+PEOPLE_OVERLAP_PROMPT = """당신은 제안서 참여인력 비교 분석가입니다.
+사용자의 질문은 여러 제안서 사이에 같은 인물이 겹치는지 확인하는 것입니다.
+
+## 매우 중요한 규칙
+1. 검색된 제안서 내용에 동일한 사람 이름이 서로 다른 제안서에서 명시적으로 확인될 때만 "겹친다"고 답하세요.
+2. 역할, 직급, 표현이 비슷하다는 이유만으로 같은 사람이라고 추론하지 마세요.
+3. 한 제안서 안에서 같은 이름이 여러 번 반복되어도 그것만으로 "제안서 간 중복"이라고 판단하지 마세요.
+4. 같은 파일명 아래의 여러 청크/페이지는 모두 동일한 하나의 제안서입니다. 서로 다른 제안서로 세면 안 됩니다.
+5. 이름이 일부만 보이거나 표가 잘려 있어 동일 인물 여부를 확정할 수 없으면 "확인 불가"라고 답하세요.
+6. 답변은 반드시 제안서 파일명과 페이지를 근거로 제시하세요.
+7. 가능하면 아래 형식을 따르세요.
+
+## 답변 형식
+- 확인 결과: 겹침 있음 / 겹침 확인 불가 / 겹침 없음
+- 근거:
+  - 파일명, 페이지, 확인된 이름
+- 주의:
+  - OCR 누락, 표 잘림, 약칭 등으로 확정이 어려운 경우 명시
 
 ## 검색된 제안서 정보:
 {context}
@@ -92,7 +144,58 @@ def format_documents(docs: list[Document]) -> str:
             f"- **연도**: {meta.get('year', 'Unknown')}년\n"
             f"- **프로젝트명**: {meta.get('project_name', 'Unknown')}\n"
             f"- **페이지**: {meta.get('page_number', '-')}\n"
+            f"- **타입/라벨**: {meta.get('content_type', 'text')} / {meta.get('chunk_label', '기타')}\n"
             f"- **내용**:\n{doc.page_content}\n"
+        )
+
+    return "\n---\n".join(formatted)
+
+
+def format_documents_grouped_by_file(docs: list[Document]) -> str:
+    """
+    같은 파일의 여러 청크를 하나의 제안서로 묶어 프롬프트에 전달한다.
+    참여인력 중복 확인처럼 파일 단위 판정이 중요한 질문에 사용한다.
+    """
+    if not docs:
+        return "검색된 제안서가 없습니다."
+
+    grouped: dict[str, list[Document]] = {}
+    order: list[str] = []
+    for doc in docs:
+        file_name = (doc.metadata or {}).get("file_name", "Unknown")
+        if file_name not in grouped:
+            grouped[file_name] = []
+            order.append(file_name)
+        grouped[file_name].append(doc)
+
+    formatted = []
+    for index, file_name in enumerate(order, 1):
+        file_docs = grouped[file_name]
+        first_meta = file_docs[0].metadata or {}
+        page_numbers = []
+        for doc in file_docs:
+            page = (doc.metadata or {}).get("page_number")
+            if page is not None and page not in page_numbers:
+                page_numbers.append(page)
+
+        chunk_lines = []
+        for chunk_index, doc in enumerate(file_docs, 1):
+            meta = doc.metadata or {}
+            chunk_lines.append(
+                f"  - 청크 {chunk_index} | p{meta.get('page_number', '-')} | "
+                f"{meta.get('content_type', 'text')} / {meta.get('chunk_label', '기타')}\n"
+                f"    {doc.page_content}"
+            )
+
+        formatted.append(
+            f"### 파일 {index}\n"
+            f"- **파일명**: {file_name}\n"
+            f"- **부문**: {first_meta.get('department', 'Unknown')}\n"
+            f"- **연도**: {first_meta.get('year', 'Unknown')}년\n"
+            f"- **프로젝트명**: {first_meta.get('project_name', 'Unknown')}\n"
+            f"- **참조 페이지**: {', '.join(str(page) for page in page_numbers) if page_numbers else '-'}\n"
+            f"- **같은 파일 내 청크 수**: {len(file_docs)}\n"
+            f"- **내용 묶음**:\n" + "\n".join(chunk_lines)
         )
 
     return "\n---\n".join(formatted)
@@ -297,8 +400,12 @@ class RAGChain:
                 else "Dense Retrieval (코사인 유사도)"
             ),
             "retriever_mode": self.retriever_mode,
+            "retrieval_query": retrieval_query,
+            "query_vector": retrieval_info.get("query_vector"),
             "cluster_enabled": retrieval_info.get("cluster_enabled", False),
             "clusters": retrieval_info.get("clusters", 0),
+            "selected_clusters": retrieval_info.get("selected_clusters", []),
+            "summary_guidance": retrieval_info.get("summary_guidance", {}),
             "dense_weight": retrieval_info.get("dense_weight"),
             "sparse_weight": retrieval_info.get("sparse_weight"),
             "results_count": len(docs),
@@ -318,6 +425,8 @@ class RAGChain:
                     "sparse_score": doc.metadata.get("sparse_score"),
                     "hybrid_score": doc.metadata.get("hybrid_score"),
                     "cluster_id": doc.metadata.get("cluster_id"),
+                    "content_type": doc.metadata.get("content_type"),
+                    "chunk_label": doc.metadata.get("chunk_label"),
                     "preview": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content,
                 }
                 for i, doc in enumerate(docs)
@@ -329,14 +438,32 @@ class RAGChain:
             return "관련된 제안서를 찾지 못했습니다. 다른 키워드로 검색해보세요.", [], pipeline_info
 
         # ── Step 3: 프롬프트 생성 ─────────────────────────
-        context = format_documents(docs)
+        is_people_query = is_people_question(question)
+        is_overlap_query = is_people_overlap_question(question)
+        context = (
+            format_documents_grouped_by_file(docs)
+            if is_people_query
+            else format_documents(docs)
+        )
         # 작은 컨텍스트 LLM(예: 2k) 대응 기본 길이 제한
         initial_context_chars = int(os.getenv("PROMPT_CONTEXT_CHARS", "2400"))
         context = self._shrink_text(context, initial_context_chars)
-        prompt = SYSTEM_PROMPT.format(context=context, question=question)
+        if is_overlap_query:
+            prompt_template = PEOPLE_OVERLAP_PROMPT
+        elif is_people_query:
+            prompt_template = PEOPLE_QUERY_PROMPT
+        else:
+            prompt_template = SYSTEM_PROMPT
+        prompt = prompt_template.format(context=context, question=question)
 
         pipeline_info["prompt"] = {
-            "template": "시스템 프롬프트 + 검색 컨텍스트 + 사용자 질문",
+            "template": (
+                "참여인력 중복 확인 전용 프롬프트 + 검색 컨텍스트 + 사용자 질문"
+                if is_overlap_query
+                else "참여인력 정리 전용 프롬프트 + 검색 컨텍스트 + 사용자 질문"
+                if is_people_query
+                else "시스템 프롬프트 + 검색 컨텍스트 + 사용자 질문"
+            ),
             "context_length": len(context),
             "total_prompt_length": len(prompt),
             "prompt_preview": prompt[:500] + "...(이하 생략)" if len(prompt) > 500 else prompt,
@@ -372,7 +499,7 @@ class RAGChain:
                     if new_len <= 300:
                         raise
                     context = self._shrink_text(context, new_len)
-                    prompt = SYSTEM_PROMPT.format(context=context, question=question)
+                    prompt = prompt_template.format(context=context, question=question)
                     pipeline_info["prompt"]["context_length"] = len(context)
                     pipeline_info["prompt"]["total_prompt_length"] = len(prompt)
                     pipeline_info["prompt"]["prompt_preview"] = (

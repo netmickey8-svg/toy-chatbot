@@ -40,6 +40,12 @@ INDEX_LOG_DIR: Path = VECTORSTORE_DIR / "index_logs"
 # 사전 군집화 메타데이터 저장 경로
 CLUSTER_INDEX_PATH: Path = VECTORSTORE_DIR / "cluster_index.json"
 
+# 요약 인덱스 저장 경로
+SUMMARY_INDEX_PATH: Path = VECTORSTORE_DIR / "summary_index.json"
+
+# 문서 요약 클러스터 저장 경로
+DOCUMENT_CLUSTER_INDEX_PATH: Path = VECTORSTORE_DIR / "document_cluster_index.json"
+
 # ──────────────────────────────────────────────
 # LLM API 설정 (OpenAI 호환 로컬 서버)
 # ──────────────────────────────────────────────
@@ -90,8 +96,13 @@ QDRANT_COLLECTION: str = os.getenv("QDRANT_COLLECTION", "proposals")
 
 # 사전 군집화 설정
 CLUSTERING_ENABLED: bool = os.getenv("CLUSTERING_ENABLED", "true").lower() == "true"
-CLUSTER_N_CLUSTERS: int = int(os.getenv("CLUSTER_N_CLUSTERS", "12"))
-CLUSTER_TOP_N: int = int(os.getenv("CLUSTER_TOP_N", "2"))
+CLUSTER_N_CLUSTERS: int = int(os.getenv("CLUSTER_N_CLUSTERS", "24"))
+CLUSTER_TOP_N: int = int(os.getenv("CLUSTER_TOP_N", "3"))
+SUMMARY_TOP_DOCS: int = int(os.getenv("SUMMARY_TOP_DOCS", "4"))
+SUMMARY_TOP_SECTIONS: int = int(os.getenv("SUMMARY_TOP_SECTIONS", "8"))
+DOCUMENT_CLUSTER_N_CLUSTERS: int = int(os.getenv("DOCUMENT_CLUSTER_N_CLUSTERS", "6"))
+DOCUMENT_CLUSTER_MIN_CLUSTER_SIZE: int = int(os.getenv("DOCUMENT_CLUSTER_MIN_CLUSTER_SIZE", "2"))
+DOCUMENT_CLUSTER_MIN_SAMPLES: int = int(os.getenv("DOCUMENT_CLUSTER_MIN_SAMPLES", "1"))
 
 # ──────────────────────────────────────────────
 # OCR 설정 (이미지 기반 PDF 텍스트 추출)
@@ -123,3 +134,15 @@ CHUNK_OVERLAP: int = 100
 # ──────────────────────────────────────────────
 # 한 번 검색 시 반환할 최대 문서(청크) 수
 TOP_K_RESULTS: int = 5
+
+# 초기 retrieval 후보를 더 넓게 가져와 후처리 다양성을 확보
+RETRIEVAL_FETCH_MULTIPLIER: int = int(os.getenv("RETRIEVAL_FETCH_MULTIPLIER", "4"))
+
+# 한 파일에서 최종 응답에 포함할 최대 청크 수
+MAX_CHUNKS_PER_FILE: int = int(os.getenv("MAX_CHUNKS_PER_FILE", "2"))
+
+# OCR 청크 기본 패널티 (검색 후처리)
+OCR_SCORE_PENALTY: float = float(os.getenv("OCR_SCORE_PENALTY", "0.05"))
+
+# 사람/예산/일정 등 구조형 질문에서 OCR 청크 추가 패널티
+OCR_FOCUS_EXTRA_PENALTY: float = float(os.getenv("OCR_FOCUS_EXTRA_PENALTY", "0.07"))

@@ -35,6 +35,12 @@ from config import (
     TOP_K_RESULTS,
 )
 from src.cluster_index import build_cluster_index_from_rows, clear_cluster_index, save_cluster_index
+from src.document_cluster_index import (
+    build_document_cluster_index,
+    clear_document_cluster_index,
+    save_document_cluster_index,
+)
+from src.summary_index import build_summary_index_from_rows, clear_summary_index, save_summary_index
 
 
 SIMPLE_STORE_FILE = VECTORSTORE_DIR / "simple_store.json"
@@ -62,9 +68,16 @@ def _meta_match(meta: dict, where: dict | None) -> bool:
     return True
 
 
-def _build_qdrant_filter(where: dict | None) -> models.Filter | None:
+def _collect_qdrant_must_conditions(where: dict | None) -> list[models.FieldCondition]:
     if not where:
-        return None
+        return []
+
+    if "$and" in where:
+        must: list[models.FieldCondition] = []
+        for cond in where["$and"]:
+            must.extend(_collect_qdrant_must_conditions(cond))
+        return must
+
     must: list[models.FieldCondition] = []
     for key, cond in where.items():
         if isinstance(cond, dict) and "$eq" in cond:
@@ -81,6 +94,18 @@ def _build_qdrant_filter(where: dict | None) -> models.Filter | None:
                     match=models.MatchAny(any=cond["$in"]),
                 )
             )
+        else:
+            must.append(
+                models.FieldCondition(
+                    key=key,
+                    match=models.MatchValue(value=cond),
+                )
+            )
+    return must
+
+
+def _build_qdrant_filter(where: dict | None) -> models.Filter | None:
+    must = _collect_qdrant_must_conditions(where)
     if not must:
         return None
     return models.Filter(must=must)
@@ -429,6 +454,7 @@ def create_vectorstore(chunks: list[Document]):
         sample_vec = embedding_fn([chunks[0].page_content])[0]
         collection.reset(vector_size=len(sample_vec))
     collection = upsert_vectorstore(chunks, collection=collection)
+    rebuild_summary_index(collection, embedding_fn=embedding_fn)
     if CLUSTERING_ENABLED:
         recluster_collection(collection)
     else:
@@ -558,3 +584,36 @@ def recluster_collection(collection: Any | None = None) -> dict[str, Any] | None
     collection.set_cluster_ids(assignments)
     save_cluster_index(cluster_meta)
     return cluster_meta
+
+
+def rebuild_summary_index(
+    collection: Any | None = None,
+    embedding_fn=None,
+) -> dict[str, Any] | None:
+    if collection is None:
+        collection = load_vectorstore()
+        if collection is None:
+            return None
+
+    rows = get_corpus_rows(collection=collection)
+    if not rows:
+        clear_summary_index()
+        clear_document_cluster_index()
+        return None
+
+    if embedding_fn is None:
+        embedding_fn = _get_embedding_function()
+
+    summary_index = build_summary_index_from_rows(rows, embedding_fn)
+    if not summary_index:
+        clear_summary_index()
+        clear_document_cluster_index()
+        return None
+
+    save_summary_index(summary_index)
+    document_cluster_index = build_document_cluster_index(summary_index)
+    if document_cluster_index:
+        save_document_cluster_index(document_cluster_index)
+    else:
+        clear_document_cluster_index()
+    return summary_index

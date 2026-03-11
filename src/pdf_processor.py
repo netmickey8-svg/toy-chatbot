@@ -74,6 +74,20 @@ class PageContent:
     """
     page_number: int
     content:     str
+    blocks:      list["ContentBlock"] = field(default_factory=list)
+
+
+@dataclass
+class ContentBlock:
+    """
+    페이지 내부의 추출 블록
+
+    Attributes:
+        content_type: text / table / ocr
+        content:      블록 본문
+    """
+    content_type: str
+    content: str
 
 
 @dataclass
@@ -238,16 +252,20 @@ def extract_pages_from_pdf(file_path: Path) -> tuple[list[PageContent], int, dic
 
             # 3가지 결과 결합 (섹션 구분자로 LLM 인식 용이)
             parts = []
+            blocks: list[ContentBlock] = []
             if page_text.strip():
                 parts.append(page_text)
+                blocks.append(ContentBlock(content_type="text", content=page_text.strip()))
             if table_text.strip():
                 parts.append("[TABLE]\n" + table_text)
+                blocks.append(ContentBlock(content_type="table", content=table_text.strip()))
             if ocr_text.strip():
                 parts.append("[OCR]\n" + ocr_text)
+                blocks.append(ContentBlock(content_type="ocr", content=ocr_text.strip()))
 
             combined = "\n\n".join(parts).strip()
             if combined:
-                pages.append(PageContent(page_number=page_num, content=combined))
+                pages.append(PageContent(page_number=page_num, content=combined, blocks=blocks))
                 stats["extracted_pages"] += 1
                 stats["total_chars"] += len(combined)
 
